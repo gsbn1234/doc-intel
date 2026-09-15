@@ -23,3 +23,10 @@ faiss_db/
 .idea/
 .langgraph_api/
 *.pckl
+
+# ========== 面试准备材料（本地保留，不入库）==========
+# 这些是我按项目代码写的面试复习稿，含大量个人化的口述话术，不适合公开在 GitHub 上。
+# 加这一条是为了挡"git add -A / git add ."这类顺带提交 —— 7a33631 就是这么把
+# interview_review.md 带进去的，之后一直没人发现。
+# 注意：如果哪天确实想提交某一个，得 git add -f 显式强制。
+interview_*.md
