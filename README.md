@@ -33,7 +33,7 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 - **多 Agent 协作**：Supervisor（调度）→ Researcher（本地库 + 联网搜索）→ Writer（成文）→ Reviewer（质量审核，不合格自动打回重搜），各节点各司其职，上下文互不污染
 - **混合检索**：child 小块（200 字符）上做 FAISS + BM25 混合，映射回 parent 大块（800 字符），搜得准且上下文完整
 - **检索增强**：Query Rewrite、Multi-Query、HyDE、CrossEncoder Rerank、Context Compression 全链路
-- **长期记忆**：LangGraph Store 记住用户偏好（"记住…"），MySQL 持久化多轮对话 checkpoint（AIOMySQLSaver）
+- **长期记忆**：LangGraph Store 记住用户偏好（"记住…"）。对话 checkpoint 与长期偏好都持久化到 **MySQL**（`AIOMySQLSaver` + `AIOMySQLStore`），后端重启不丢
 - **MCP 扩展**：Researcher 可调用自定义 MCP Server 工具
 - **流式输出**：SSE（Server-Sent Events）实时推送搜索状态、工具调用和最终答案
 - **可评估**：LLM-as-Judge 三维度（Context Recall / Faithfulness / Answer Relevancy）评测脚本
@@ -173,7 +173,7 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 | 检索 | FAISS 向量库、rank_bm25、jieba 中文分词 |
 | 联网 | Tavily Search API |
 | 服务 | FastAPI + SSE、Streamlit、MCP（FastMCP） |
-| 记忆 | LangGraph Store（InMemory）、AIOMySQLSaver（MySQL checkpoint，多轮对话持久化） |
+| 记忆 | AIOMySQLSaver（MySQL，多轮对话 checkpoint）+ AIOMySQLStore（MySQL，长期偏好），各用一条独立连接池 |
 | 可观测 | LangSmith 全链路追踪（LLM 调用 / Agent 步骤 / 工具轨迹） |
 | 测试 | pytest（tests/ 目录，离线测试，不联网不烧 token） |
 
@@ -205,7 +205,7 @@ doc-intel/
 ├── streamlit_1/
 │   ├── backend.py             # FastAPI 后端（上传 / 流式对话 / 健康检查）
 │   ├── session_store.py       # 会话元数据（Redis）+ 索引目录管理
-│   ├── db.py                  # MySQL 连接配置 / DSN / 健康探测
+│   ├── db.py                  # MySQL 连接参数 / 连接池 / 健康探测
 │   └── app.py                 # Streamlit 前端
 ├── mcp_tools/                 # 自定义 MCP Server（领域化工具注册）
 │   ├── registry.py            #   领域 → 工具白名单（ai_learning/general/...）
@@ -300,7 +300,8 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
     "session_dir":  {"status": "ok", "path": "faiss_db/sessions"},
     "mcp":          {"status": "not_started"},
     "mysql":        {"status": "ok", "database": "doc_intel"},
-    "checkpointer": {"status": "ok"}
+    "checkpointer": {"status": "ok", "backend": "mysql"},
+    "store":        {"status": "ok", "backend": "mysql"}
   },
   "active_sessions": 3
 }
@@ -308,6 +309,7 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
 
 - Redis 或索引目录出问题 → `status: "error"`，HTTP **503**（硬依赖挂了，该把流量摘走）。
 - 只有 MCP 或 MySQL 出问题 → `status: "degraded"`，HTTP 仍是 **200**（MCP 会退回纯本地检索，MySQL 挂了记忆退回进程内存，都不该因此把整个服务判死）。`not_started` 是 MCP 懒加载的正常初始态，不算降级。
+- `checkpointer` 和 `store` 回答的是**各自**的问题，不能互相代表：`mysql` 说"此刻连得上库吗"，这两个说"东西建起来没有"。库活着但表没建起来（比如账号缺 `CREATE` 权限）时就是 `mysql: ok` + 两个都报 `memory` —— 这个组合最能说明问题。两者各用一条独立连接池、各自独立降级，所以"一个成了另一个没成"是真实可能的，健康检查分开报就是为了不把这种半边坏掉的情况掩盖成"一切正常"。
 
 **接口文档：<http://127.0.0.1:8000/docs>**
 
@@ -377,7 +379,7 @@ python eval_baseline.py       # 三档基线对比（无检索 vs 单路 vs 完�
 
 - **换目录跑就报错 / 找不到 docs**：所有路径统一在 `multi_agent/config.py` 中按项目根计算，请勿自行硬编码相对路径。
 - **faiss_db 索引过期**：`docs/` 内容更新后需删除 `faiss_db/` 重新建索引（目前索引按"存在即复用"策略，暂未自动校验文档变更）。
-- **对话记忆重启丢失**：多轮对话 checkpoint 存在 **MySQL** 里（`AIOMySQLSaver`，建表在启动时由 `setup()` 自动完成），后端重启不丢。若启动时连不上 MySQL 或建表失败，会**降级**为进程内存（重启即清空）并在日志里留 warning，此时 `/api/health` 的 `checkpointer` 会如实报 `{"status": "memory"}` 而不是笼统的 ok —— 库活着但账号缺 `CREATE` 权限就正好是这个组合。长期偏好记忆用的是内存 Store，重启即清空。
+- **记忆重启丢失**：对话记忆（多轮对话 checkpoint，`AIOMySQLSaver`）和长期记忆（用户偏好，`AIOMySQLStore`）都存在 **MySQL** 里，后端重启不丢。两者的建表都在启动时由各自的 `setup()` 自动完成，各用一条独立连接池（saver 挂在图执行的每一步关键路径上，独立池能让 store 的批量读写抢不走它的连接）。若启动时连不上 MySQL 或建表失败，对应那一项会**降级**为进程内存（重启即清空）并在日志里留 warning，`/api/health` 里如实报 `{"status": "memory"}` 而不是笼统的 ok —— 库活着但账号缺 `CREATE` 权限就正好是这个组合。注意长期记忆降级的是**内存版 store 而不是空值**：图里的 `rewrite_query` 节点会真的调它读写偏好，给空值会直接让问答报错，比"偏好重启后丢了"严重得多。
 
 ---
 

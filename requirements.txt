@@ -1,8 +1,11 @@
 # 由本机 venv pip freeze 生成（2026-08-26），确保容器复刻与本地完全一致的环境。
 # torch 不在此清单：Dockerfile 里单独从阿里云 PyTorch CPU 镜像源安装（避免拉 CUDA 版）。
 # pywin32 已剔除：Windows 专用包，Linux 镜像装不了。
-# aiomysql / PyMySQL / langgraph-checkpoint-mysql 是后来加的手工补录（MySQL 接入），
-# 不是那次 freeze 的产物。
+# aiomysql / asyncmy / PyMySQL / langgraph-checkpoint-mysql 是后来加的手工补录
+# （MySQL 接入），不是那次 freeze 的产物。
+# asyncmy 只被 langgraph.store.mysql 间接需要（它是那个包 __init__ 里 eager-import
+# 的另一个驱动，见 backend.py 顶部注释），我们自己的代码不直接用它。
+# 有 cp314 win_amd64 预编译 wheel，装的时候不编译。
 
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.1
@@ -12,6 +15,7 @@ altair==6.2.2
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.14.2
+asyncmy==0.2.14
 attrs==26.1.0
 bcrypt==5.0.0
 blinker==1.9.0

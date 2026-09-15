@@ -16,6 +16,8 @@
   · 关停时真的会去 close_mcp（这类钩子漏挂平时没症状，只有退出时才看得出来）
   · 对话记忆的 MySQL checkpointer：建起来了要收池、要复位全局；建不起来只降级
     （不抛异常、不泄漏池），健康检查里如实报 memory 而不是笼统的 ok
+  · 长期记忆的 MySQL store：同上，但降级目标是**能用的内存 store**而不是 None，
+    且它走自己独立的连接池（不和 checkpointer 共用）
 
 不碰网络、不碰真 Redis：外部依赖全换成桩。
 """
@@ -159,7 +161,9 @@ def test_health_ok_when_all_dependencies_up(tmp_path):
     body = resp.json()
     assert body["status"] == "ok"
     assert body["active_sessions"] == 3
-    assert set(body["checks"]) == {"redis", "session_dir", "mcp", "mysql", "checkpointer"}
+    assert set(body["checks"]) == {
+        "redis", "session_dir", "mcp", "mysql", "checkpointer", "store",
+    }
     assert body["checks"]["session_dir"]["path"] == str(tmp_path)
 
 
@@ -270,13 +274,20 @@ def test_shutdown_closes_mcp():
     async def fake_close():
         called.append(True)
 
-    # lifespan 里除了关 MCP，还会去建 MySQL 连接池。这里替换掉那一步：这个用例
-    # 只管 MCP，不该因为跑测试的机器上没 MySQL 就红，也不该白等 3 秒连接超时。
+    # lifespan 里除了关 MCP，还会去建两个 MySQL 连接池（checkpointer 一个、
+    # store 一个）。这里都替换掉：这个用例只管 MCP，不该因为跑测试的机器上没
+    # MySQL 就红，也不该白等 3 秒连接超时。
     async def no_mysql():
         return None, None
 
+    async def no_mysql_store():
+        # 注意 store 的降级目标是个能用的内存 store，不是 None —— 图里的
+        # rewrite_query 节点会真的调它读写用户偏好，给 None 会在请求里炸。
+        return backend.InMemoryStore(), None
+
     with patch.object(backend, "close_mcp", fake_close), \
-         patch.object(backend, "_init_checkpointer", no_mysql):
+         patch.object(backend, "_init_checkpointer", no_mysql), \
+         patch.object(backend, "_init_store", no_mysql_store):
         with TestClient(backend.app):
             pass
     assert called, "关停时没关 MCP 子进程——它会挂在事件循环清理上刷噪音错误"
@@ -392,24 +403,84 @@ def _stub_init(saver, pool):
     return _init
 
 
+def _stub_init_store(store, pool):
+    """替掉 backend._init_store 的桩：直接给固定的 (store, pool)。"""
+    async def _init():
+        return store, pool
+
+    return _init
+
+
+# 跑 lifespan 的用例都得把这两个初始化都换掉：留着真的那个会去连测试机上的
+# MySQL（连不上白等 3 秒超时，连得上则留下真实连接池和表）。下面用一对固定的
+# 桩，顺便让"两个池是分开的"这件事可断言。
+def _both_stubs(saver=None, store=None):
+    """给 lifespan 用的一对桩 + 它们各自的假池，返回 (patches, ckpt_pool, store_pool)。"""
+    ckpt_pool, store_pool = _FakePool(), _FakePool()
+    saver = object() if saver is None else saver
+    store = object() if store is None else store
+    patches = [
+        patch.object(backend, "_init_checkpointer", _stub_init(saver, ckpt_pool)),
+        patch.object(backend, "_init_store", _stub_init_store(store, store_pool)),
+    ]
+    return patches, (saver, ckpt_pool, store, store_pool)
+
+
 def test_lifespan_creates_checkpointer_and_closes_pool():
     """启动时把模块级 checkpointer 指向 MySQL saver；关停时收池并复位全局。
 
     复位那一步最容易漏：同一个进程里会反复进出 lifespan，不复位的话第二次
     拿到的就是指向已关闭池的悬空 saver（报错现场在 saver 里，看不出根因）。
     """
-    saver, pool = object(), _FakePool()
+    patches, (saver, ckpt_pool, _store, _store_pool) = _both_stubs()
 
-    with patch.object(backend, "_init_checkpointer", _stub_init(saver, pool)):
+    for p in patches:
+        p.start()
+    try:
         with TestClient(backend.app):
             assert backend.checkpointer is saver, (
                 "启动后全局 checkpointer 没指向 MySQL saver——"
                 "多半是 lifespan 里漏了 `global checkpointer`，赋值落到局部变量上了"
             )
-        assert pool.closed, "关停时没关连接池"
-        assert pool.waited, "close() 只是标记关闭，必须 await wait_closed() 才算收完"
+        assert ckpt_pool.closed, "关停时没关连接池"
+        assert ckpt_pool.waited, "close() 只是标记关闭，必须 await wait_closed() 才算收完"
+    finally:
+        for p in patches:
+            p.stop()
 
     assert backend.checkpointer is None, "关停后没复位，留下指向已关闭池的悬空引用"
+
+
+def test_lifespan_creates_store_on_its_own_pool():
+    """store 走自己那条连接池，和 checkpointer 的不是同一个。
+
+    这是刻意的设计决定，不是实现细节：saver 挂在图执行的每一步关键路径上，
+    两边共用一个池的话，store 的批量读写会抢走它的连接、把 checkpoint 写入拖住。
+    所以这里断言的是"两个池对象不同 + 关停时两个都被收掉"，
+    哪天有人图省事把两个池合并成一个，这条会红。
+    """
+    patches, (_saver, ckpt_pool, store, store_pool) = _both_stubs()
+
+    for p in patches:
+        p.start()
+    try:
+        with TestClient(backend.app):
+            assert backend.store is store, (
+                "启动后全局 store 没指向 MySQL store——"
+                "多半是 lifespan 里漏了 `global store`，赋值落到局部变量上了"
+            )
+        assert store_pool is not ckpt_pool, "两个池不能是同一个对象"
+        # 两个池各自独立关闭，漏掉任何一个都会把连接挂在 MySQL 侧
+        assert ckpt_pool.closed and ckpt_pool.waited, "checkpointer 的池没收干净"
+        assert store_pool.closed and store_pool.waited, "store 的池没收干净"
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert isinstance(backend.store, backend.InMemoryStore), (
+        "关停后 store 该复位成内存版（能用的降级态），而不是留着"
+        "指向已关闭池的悬空引用 —— 图里的 rewrite_query 节点会真的调它"
+    )
 
 
 def test_init_checkpointer_degrades_when_mysql_unreachable():
@@ -475,3 +546,108 @@ def test_health_reports_mysql_backed_checkpointer(monkeypatch):
                    mcp={"status": "connected"}).json()
 
     assert body["checks"]["checkpointer"] == {"status": "ok", "backend": "mysql"}
+
+
+# ========== 六、长期记忆（MySQL store 接线） ==========
+#
+# 和第五节同构，但有一处**关键差别**必须锁死：store 建不起来时不能降级成 None。
+# checkpointer 给 None 是安全的（build_multi_agent_graph 内部会退回 MemorySaver），
+# 但 store 给 None 会在请求里炸 —— 图里的 rewrite_query 节点会真的调它读写用户偏好。
+# 所以 store 的降级目标是一个能用的 InMemoryStore。
+
+def _real_mysql_store():
+    """造一个真的 AIOMySQLStore 实例，只为让健康检查的 isinstance 判成 mysql。
+
+    构造它需要一个运行中的事件循环（内部要 asyncio.get_running_loop()），
+    但**不需要真连接**：conn 在构造期只是被存下来，不碰数据库。所以传个 object()
+    就行，测试不必依赖测试机上有没有 MySQL。
+    """
+    async def _make():
+        return backend.AIOMySQLStore(conn=object())
+
+    return asyncio.run(_make())
+
+
+def test_init_store_degrades_to_inmemory_when_mysql_unreachable():
+    """MySQL 连不上时降级成内存 store，而不是 None。
+
+    这条是本节的要点：传 None 会让"记住我的偏好"在用户提问时直接抛异常，
+    比"偏好重启后丢了"严重得多 —— 前者是功能挂掉，后者只是降级。
+    """
+    async def boom(*args, **kwargs):      # 建池是带 min/maxsize 关键字调的
+        raise OSError("connection refused")
+
+    with patch.object(backend, "create_mysql_pool", boom):
+        st, pool = asyncio.run(backend._init_store())
+
+    assert isinstance(st, backend.InMemoryStore), (
+        "store 降级目标必须是能用的内存 store；返回 None 会让 rewrite_query 节点炸"
+    )
+    assert pool is None, "池都没建成，不该返回池"
+
+
+def test_init_store_closes_pool_when_setup_fails():
+    """池建成了但建表失败：池必须收掉，不能泄漏。
+
+    和 checkpointer 那边同理 —— 最容易出的岔子是把 setup() 的异常直接抛出去，
+    应用没起来、池却已经建好且没人收。
+    """
+    pool = _FakePool()
+
+    async def fake_create_pool(*args, **kwargs):
+        return pool
+
+    class _BadStore:
+        def __init__(self, conn=None):
+            assert conn is pool, "store 必须拿到建好的那个池"
+
+        async def setup(self):
+            raise RuntimeError("CREATE TABLE 被拒（账号缺 CREATE 权限）")
+
+    with patch.object(backend, "create_mysql_pool", fake_create_pool), \
+         patch.object(backend, "AIOMySQLStore", _BadStore):
+        st, got_pool = asyncio.run(backend._init_store())
+
+    assert isinstance(st, backend.InMemoryStore), (
+        "建表失败也该拿到能用的内存 store，不能是 None"
+    )
+    assert got_pool is None
+    assert pool.closed and pool.waited, "建表失败后池没被收掉，连接泄漏了"
+
+
+def test_health_tells_apart_mysql_probe_and_store(monkeypatch):
+    """mysql 探针说 ok、store 说 memory：库是活的，但 store 的表没建起来。
+    两个字段各说各的，且退化不参与 overall 判定。"""
+    monkeypatch.setattr(backend, "store", backend.InMemoryStore())
+    body = _health(redis={"status": "ok", "active_sessions": 1},
+                   mcp={"status": "connected"}).json()
+
+    assert body["checks"]["mysql"]["status"] == "ok"
+    assert body["checks"]["store"]["status"] == "memory"
+    assert "detail" in body["checks"]["store"], "退化时要说明退到哪去了"
+    assert body["status"] == "ok", "store 退化不该影响 overall"
+
+
+def test_health_reports_mysql_backed_store(monkeypatch):
+    """store 建起来时，状态要明确说是 MySQL 撑的，而不是笼统的 ok。"""
+    monkeypatch.setattr(backend, "store", _real_mysql_store())
+    body = _health(redis={"status": "ok", "active_sessions": 1},
+                   mcp={"status": "connected"}).json()
+
+    assert body["checks"]["store"] == {"status": "ok", "backend": "mysql"}
+
+
+def test_health_reports_checkpointer_and_store_independently(monkeypatch):
+    """两个组件分开报，不能用一个的状态去代表另一个。
+
+    它们各自独立的池、各自独立降级，所以"一个成了另一个没成"是真实可能的
+    （比如 store 的迁移脚本失败，而 checkpoint 的表早就建好了）。合成一个字段
+    报的话，这种半边坏掉的情况就会被掩盖成"一切正常"。
+    """
+    monkeypatch.setattr(backend, "checkpointer", object())           # 对话记忆建起来了
+    monkeypatch.setattr(backend, "store", backend.InMemoryStore())   # 长期记忆没起来
+    body = _health(redis={"status": "ok", "active_sessions": 1},
+                   mcp={"status": "connected"}).json()
+
+    assert body["checks"]["checkpointer"] == {"status": "ok", "backend": "mysql"}
+    assert body["checks"]["store"]["status"] == "memory"

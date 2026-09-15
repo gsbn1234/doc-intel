@@ -78,7 +78,10 @@ def mysql_connect_kwargs(**overrides):
 
 
 async def create_mysql_pool(minsize=1, maxsize=5):
-    """建一个 aiomysql 连接池，给 LangGraph 的 saver / store 共用。
+    """建一个 aiomysql 连接池。
+
+    saver 和 store 各建一个（同一函数、不同尺寸），不共用。池本身的配置两边
+    完全一样，没必要拆成两个函数；尺寸分开的理由见下面 maxsize 那段。
 
     为什么是池，而不是官方文档里的单连接（from_conn_string）：
 
@@ -94,8 +97,14 @@ async def create_mysql_pool(minsize=1, maxsize=5):
       pool.acquire()/release（见 langgraph .../mysql/_ainternal.py），所以年龄检查
       每次读写都会跑到，不存在"连接一直没人取、年龄检查不到"的死角。
 
-    maxsize=5 够用：saver 内部有一把 asyncio.Lock 把所有读写串起来，同一时刻最多
-    占一条；余量留给健康探测和以后的 store。
+    maxsize 为什么取这个量级：saver 和 store 内部**各自**都有一把 asyncio.Lock
+    把所有读写串起来（checkpoint/mysql/aio_base.py:42、store/mysql/aio_base.py:49），
+    所以每个池同一时刻真正被占用的连接都很少。数字给的是余量，不是并发需求 ——
+    minsize=1 让空闲时只维持一条连接，maxsize 只是天花板，不预先开。
+    健康探针不从这里取连接（mysql_status 每次现开现关），所以没给它留额度。
+
+    两个池不共用是刻意的：saver 挂在图执行的每一步关键路径上，独立池能让 store
+    的批量读写抢不走它的连接；反过来 store 建表失败也不会连累对话记忆。
     """
     return await aiomysql.create_pool(
         **mysql_connect_kwargs(),

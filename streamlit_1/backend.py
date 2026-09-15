@@ -41,9 +41,26 @@ from multi_agent.llm import get_llm
 from multi_agent.multi_agent_graph import build_multi_agent_graph, extract_answer, load_mcp_tools, mcp_status, close_mcp
 
 from langgraph.checkpoint.mysql.aio import AIOMySQLSaver
+from langgraph.store.mysql.aio import AIOMySQLStore
 from langgraph.store.memory import InMemoryStore
 
-store = InMemoryStore()  # 全局唯一长期记忆，跨会话共享（内存版，后端重启即清空）
+# 全局唯一长期记忆，跨会话共享（图里用它做命名空间 users/{user_id} 的隔离）。
+#
+# 这里是**占位**，不是最终实例：真正的 MySQL store 在 lifespan 启动时建。
+# 两个原因建不了在模块顶层 —— 建池要 await，而 import 发生在还没有事件循环的
+# 时刻；且 AIOMySQLStore 构造时就要 asyncio.get_running_loop()（它内部
+# AsyncBatchedBaseStore 把批处理 worker 挂在这个 loop 上），没循环直接抛
+# RuntimeError。
+#
+# 它同时是**降级目标**：_init_store() 建不起来就原样留着这个内存版，长期记忆
+# 退化成进程内存（重启即清空），但"记住我之前说过什么"的功能照常可用 ——
+# 和 checkpointer 失败退回 MemorySaver 是同一个判断。
+#
+# 注意别改成给 build_multi_agent_graph 传 store=None：那边的兜底是
+# `if store is None: store = InMemoryStore()`（multi_agent_graph.py:768），
+# 会给**每个会话各建一个**，长期记忆就不跨会话了。必须显式传这个共享实例。
+store = InMemoryStore()
+
 # ========== 持久化记忆：MySQL checkpointer ==========
 # 对话记忆（checkpoint）落到 MySQL，后端重启不丢、多进程共享同一份。
 #
@@ -54,13 +71,19 @@ store = InMemoryStore()  # 全局唯一长期记忆，跨会话共享（内存�
 # 是同一个判断：连不上库不该让整个服务起不来。
 checkpointer = None
 
-# 注意上面这行 import 特意没包 try/except ImportError。
+# 注意上面两个 langgraph mysql 的 import 特意都没包 try/except ImportError。
 # 原来那版 SqliteSaver 是包了的（"没装就退回内存版，不报错"），结果 langgraph-
 # checkpoint-sqlite 从头到尾就没装进依赖里，ImportError 被静默吞掉，于是对话记忆
 # 从来没有真正落过盘（checkpoints.sqlite 一直是 0 字节），而且没有任何症状。
 # 缺依赖是打包错误，不是运行期状况，就该在启动时响亮地炸掉。
-# （包本身可以裸 import：langgraph/checkpoint/mysql/__init__.py 不导驱动，
-#  真正需要 aiomysql 的只有 .aio 子模块，而 aiomysql 已在 requirements 里。）
+# （checkpoint 那个包可以裸 import：langgraph/checkpoint/mysql/__init__.py 不导
+#  驱动，真正需要 aiomysql 的只有 .aio 子模块，而 aiomysql 已在 requirements 里。）
+#
+# store 这边还多一层：`from langgraph.store.mysql.aio import ...` 会先执行父包
+# langgraph/store/mysql/__init__.py，而它第 2 行是 `from ...asyncmy import
+# AsyncMyStore` —— asyncmy 是另一个驱动（不是 aiomysql），没装的话整条 import
+# 就炸，哪怕我们只用 aio 这一个子模块。这是那个包的 eager-import 缺陷，
+# 绕不过去，只能把 asyncmy 也钉进 requirements。
 
 
 async def _init_checkpointer():
@@ -106,6 +129,44 @@ async def _init_checkpointer():
     return saver, pool
 
 
+async def _init_store():
+    """建 store 专用连接池 + 建表，返回 (store, pool)；失败降级为内存版。
+
+    和 _init_checkpointer 同构，差别只在降级目标：那边降成 None（图内部自动退回
+    MemorySaver），这边必须给一个能用的 store 对象 —— 图里的 rewrite_query 节点会
+    调 store 读写用户偏好，给 None 会直接抛异常。所以退回 InMemoryStore()：
+    偏好当次进程内照常记住，只是重启即丢。
+
+    池和 checkpointer 那个分开建（理由见 db.create_mysql_pool）：saver 在图执行的
+    每一步关键路径上，两边抢连接会让 checkpoint 写入被 store 的批量读写拖住。
+
+    setup() 同样是 CREATE TABLE IF NOT EXISTS + 迁移，幂等，每次启动都可安全重跑；
+    每次也都会打一条 SQL 告警 "Table 'store_migrations' already exists"（MySQL 1050），
+    和 checkpoint 那边同理，刻意不过滤。
+    """
+    pool = None
+    try:
+        # maxsize 比 saver 那个小：store 的写会被 AsyncBatchedBaseStore 攒成一批
+        # （多个并发的 aget/aput 合并成一次 abatch），加上内部那把 asyncio.Lock，
+        # 并发度比 saver 更低。
+        pool = await create_mysql_pool(minsize=1, maxsize=4)
+        # 和 saver 一样走 conn=pool 这个鸭子类型路径（见 _init_checkpointer 里的
+        # 说明）：store 的基类从 langgraph.checkpoint.mysql 借来同一个
+        # _ainternal.get_connection，认 acquire 就把池当池用。
+        st = AIOMySQLStore(conn=pool)
+        await st.setup()
+    except Exception as e:
+        logger.warning(
+            "MySQL store 初始化失败，长期记忆退回进程内存（重启即清空）：%s: %s",
+            type(e).__name__, e,
+        )
+        if pool is not None:
+            pool.close()
+            await pool.wait_closed()
+        return InMemoryStore(), None
+    return st, pool
+
+
 # ========== 应用生命周期 ==========
 # 原先用 @app.on_event("shutdown")，FastAPI 已弃用这套（pytest 里会打
 # DeprecationWarning，指向文档的 Lifespan Events）。lifespan 是它的正式替代：
@@ -120,11 +181,11 @@ async def _init_checkpointer():
 # 这正是 on_event 装饰器写法最容易踩的坑——它是"后注册"，所以能写在 app 之后。
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 这个 global 不能省：checkpointer 是模块级那一个，/api/chat-stream 建图、
-    # get_session 重建会话、/api/health 报状态三处都读它。不声明的话下面那行只是
-    # 在函数内新建一个同名局部变量，外面永远看不到 —— 症状是"池都建好了、
+    # 这个 global 不能省：checkpointer 和 store 都是模块级那两个，/api/chat-stream
+    # 建图、get_session 重建会话、/api/health 报状态三处都读它们。不声明的话下面
+    # 那两行只是在函数内新建同名局部变量，外面永远看不到 —— 症状是"池都建好了、
     # 日志也说连上了，记忆却还是重启就丢"，很难往作用域上想。
-    global checkpointer
+    global checkpointer, store
 
     # ---- 启动 ----
     # 留这行日志是为了在日志里标出进程重启的边界——排查"重启后第一次提问
@@ -133,11 +194,18 @@ async def lifespan(app: FastAPI):
     # 建连接池 + 建表。放在这里而不是 import 时，是因为它要 await，而模块 import
     # 发生在还没有事件循环的时刻。MCP 仍是懒加载的（等第一个带 domain 的会话
     # 才拉起子进程），这里不等它。
+    #
+    # 两个各自独立降级，互不牵连：checkpointer 挂了只影响多轮对话记忆，store 挂了
+    # 只影响长期偏好，任一个失败都只是打 warning + 那一样退化成内存版。
     checkpointer, _mysql_pool = await _init_checkpointer()
-    # 排查"重启后对话记忆还在不在"的第一现场：说 MySQL 就是持久化的；说进程内存
+    store, _store_pool = await _init_store()
+    # 排查"重启后记忆还在不在"的第一现场：说 MySQL 就是持久化的；说进程内存
     # 就说明上面那步失败了（具体原因在紧随其前的 warning 里）。
     logger.info(
         "对话记忆：%s", "MySQL（重启不丢）" if checkpointer else "进程内存（重启即清空）"
+    )
+    logger.info(
+        "长期记忆：%s", "MySQL（重启不丢）" if _store_pool else "进程内存（重启即清空）"
     )
     yield
     # ---- 关停 ----
@@ -147,11 +215,17 @@ async def lifespan(app: FastAPI):
     if _mysql_pool is not None:
         _mysql_pool.close()
         await _mysql_pool.wait_closed()
-    # 置回 None：池已经关了，再留着这个 saver 就是指向已关闭资源的悬空引用。
-    # （单测里同一个进程会多次进出 lifespan，不复位的话第二次跑就开始报
-    # "Cannot acquire connection after closing pool"，而错误现场在 saver 里，
-    # 看不出根因是上一轮没清干净。）
+    if _store_pool is not None:
+        _store_pool.close()
+        await _store_pool.wait_closed()
+    # 复位：池已经关了，再留着这两个对象就是指向已关闭资源的悬空引用。
+    # checkpointer 置 None 会退回 MemorySaver；store 置回内存版 —— 两边都保持
+    # "能用的降级态"，而不是留个悬空引用等着在请求里炸。
+    # （单测里同一个进程会多次进出 lifespan，不复位的话第二轮就开始报
+    # "Cannot acquire connection after closing pool"，而错误现场在 saver / store
+    # 内部，看不出根因是上一轮没清干净。）
     checkpointer = None
+    store = InMemoryStore()
     # 关掉全局 MCP 子进程。不关的话它会挂在 asyncio 的事件循环清理上，
     # 退出时刷一堆噪音错误，盖掉真正的报错。
     await close_mcp()
@@ -592,6 +666,19 @@ async def health(response: Response):
             else {
                 "status": "memory",
                 "detail": "MySQL 不可用或建表失败，对话记忆退化为进程内存（重启即清空）",
+            }
+        ),
+        # 长期记忆（用户偏好，图里的 rewrite_query 节点读写）。和 checkpointer 分开
+        # 报，因为两者是各自独立的池、各自独立降级：可能一个成了另一个没成
+        # （比如 store 的建表迁移失败而 checkpoint 的表早就有了）。
+        # 判据是类型而不是"池在不在"—— 降级时 lifespan 会把内存版放回这个全局，
+        # 拿 isinstance 一比就清楚，不需要再维护一个额外的布尔标志。
+        "store": (
+            {"status": "ok", "backend": "mysql"}
+            if isinstance(store, AIOMySQLStore)
+            else {
+                "status": "memory",
+                "detail": "MySQL 不可用或建表失败，长期记忆（用户偏好）退化为进程内存（重启即清空）",
             }
         ),
     }
