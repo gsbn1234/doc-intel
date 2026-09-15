@@ -108,15 +108,18 @@ async def _init_checkpointer():
         # 换来的东西值这个风险：绕开 DSN 的密码转义与字符集两个静默坑，
         # 且没有单连接 8 小时空闲被服务端掐断的问题（理由见 db.create_mysql_pool）。
         saver = AIOMySQLSaver(conn=pool)
-        # 建表是 CREATE TABLE IF NOT EXISTS，幂等，每次启动都可以安全跑一遍。
-        # 它跑的是内置的迁移脚本，顺带会把 schema 升到当前包版本要求的样子。
+        # setup() 跑内置迁移脚本，建表 + 把 schema 升到当前包版本要求的样子。
+        # 建表那句是 CREATE TABLE IF NOT EXISTS，幂等；但**写迁移版本号那句不是**，
+        # 多 worker 同时启动会撞主键。所以必须拿 langgraph_setup_lock 串起来
+        # （竞态细节、实测现象、为什么锁连接不池取，都写在 db.langgraph_setup_lock）。
         #
         # 每次启动都会看到一行 SQL 告警 "Table 'checkpoint_migrations' already
         # exists"（MySQL 1050），由 aiomysql 的 cursor 转成 Python warning 打到
         # stderr。这是 IF NOT EXISTS 命中已有表的正常结果，不是错误 —— 只有第一次
         # 启动的库才不会有。这里刻意不去 filter 掉它：告警文案随 MySQL 版本变，
         # 按文案正则过滤很脆，而且会把 setup() 真正该报的 DDL 告警一起吞掉。
-        await saver.setup()
+        async with langgraph_setup_lock():
+            await saver.setup()
     except Exception as e:
         logger.warning(
             "MySQL 初始化失败，对话记忆退回进程内存（重启即清空）：%s: %s",
@@ -140,9 +143,10 @@ async def _init_store():
     池和 checkpointer 那个分开建（理由见 db.create_mysql_pool）：saver 在图执行的
     每一步关键路径上，两边抢连接会让 checkpoint 写入被 store 的批量读写拖住。
 
-    setup() 同样是 CREATE TABLE IF NOT EXISTS + 迁移，幂等，每次启动都可安全重跑；
-    每次也都会打一条 SQL 告警 "Table 'store_migrations' already exists"（MySQL 1050），
-    和 checkpoint 那边同理，刻意不过滤。
+    setup() 同样是"建表（幂等）+ 写迁移版本号（不幂等）"，多 worker 下同样要拿
+    db.langgraph_setup_lock 串起来 —— 理由见那个函数的 docstring，不是这边特有的
+    问题。每次也都会打一条 SQL 告警 "Table 'store_migrations' already exists"
+    （MySQL 1050），和 checkpoint 那边同理，刻意不过滤。
     """
     pool = None
     try:
@@ -154,7 +158,12 @@ async def _init_store():
         # 说明）：store 的基类从 langgraph.checkpoint.mysql 借来同一个
         # _ainternal.get_connection，认 acquire 就把池当池用。
         st = AIOMySQLStore(conn=pool)
-        await st.setup()
+        # 和 checkpointer 复用同一个锁名。这里图的是省事，不是功能需要：两边的
+        # 版本表是分开的（store_migrations / checkpoint_migrations），彼此不会撞，
+        # 换一个锁名同样正确。两处获取是**顺序**的（lifespan 里先 init checkpointer
+        # 再 init store），不嵌套，所以也不会自己把自己锁住。
+        async with langgraph_setup_lock():
+            await st.setup()
     except Exception as e:
         logger.warning(
             "MySQL store 初始化失败，长期记忆退回进程内存（重启即清空）：%s: %s",
@@ -292,7 +301,7 @@ async def verify_api_key(
 from streamlit_1.session_store import (
     save_session, get_session, delete_session, redis_status, SESSIONS_DIR,
 )
-from streamlit_1.db import mysql_status, create_mysql_pool
+from streamlit_1.db import mysql_status, create_mysql_pool, langgraph_setup_lock
 
 
 # ========== 请求/响应模型 ==========

@@ -4,11 +4,16 @@
 同一份连接参数。散在各处迟早会出"健康检查连的是 A 库、真正写进去的是 B 库"这种
 最难查的问题 —— 所以参数只在这里拼一次（mysql_connect_kwargs），谁用谁取。
 
-三件事：给连接参数、建连接池、探活。建表不在这里做，归用它的 saver / store
-自己 setup()（那是幂等的）。
+四件事：给连接参数、建连接池、探活、给 LangGraph 的建表/迁移加一把跨进程锁。
+
+DDL 语句不在这里写，归用它的 saver / store 自己 setup()。但 setup() 里只有
+"建表"那半截是幂等的（CREATE TABLE IF NOT EXISTS），"写迁移版本号"那半截不是 ——
+多进程同时启动会同时读到版本表为空、同时 INSERT，晚的那个撞主键。所以 setup()
+必须拿这里的锁串起来，理由见 langgraph_setup_lock。
 """
 
 import os
+from contextlib import asynccontextmanager
 
 import aiomysql
 from dotenv import load_dotenv
@@ -114,6 +119,57 @@ async def create_mysql_pool(minsize=1, maxsize=5):
         pool_recycle=3600,    # 1 小时回收一次，离 8 小时的 wait_timeout 留足余量
         connect_timeout=3,    # 库挂了要快速失败，别把应用启动卡住
     )
+
+
+# LangGraph 建表/迁移的跨进程互斥锁名。GET_LOCK 的作用域是**整个 mysqld 实例**，
+# 不是某一个库 —— 所以名字必须带项目前缀，否则同一台 MySQL 上跑第二个项目时会
+# 互相挡住（两边都觉得"锁被别人占着"，各自等满超时后降级）。
+LANGGRAPH_SETUP_LOCK = "doc_intel:langgraph_setup"
+
+
+@asynccontextmanager
+async def langgraph_setup_lock(timeout=30):
+    """跨进程串行化 saver / store 的 setup()（建表 + 写迁移版本号）。
+
+    为什么非有不可 —— `--workers N` 时 N 个进程同时跑 lifespan 启动，每个都执行
+    一遍 setup()。那里面"建表"确实是 CREATE TABLE IF NOT EXISTS，幂等；但紧接着
+    "写迁移版本号"那句不是：两个进程同时读到版本表为空、同时 INSERT，晚的那个撞
+    主键（IntegrityError 1062），异常被 _init_checkpointer 的兜底 except 接住后
+    降级成进程内存。
+
+    后果不是"启动报错"而是**静默的行为分裂**：同一份代码、同一个端口，落到那个
+    worker 上的请求，对话记忆重启就丢；重启一次丢的是哪个 worker 还是随机的。
+    单 worker 时这个交错不可能出现，所以本机开发全程没暴露过 —— 它是 Step 4
+    开多 worker 才引入的。实测：容器起来后连打 30 次 /api/health，28 次报
+    checkpointer=mysql、2 次报 checkpointer=memory。
+
+    锁连接**不从池里取**，单独开一条临时连接。若从池里取会死锁：N 个 worker
+    各占一条连接在 GET_LOCK 上排队，池一满，拿到锁的那个也借不到连接去真正跑
+    setup，只能等 GET_LOCK 超时才解开。独占一条，占用就与池容量、worker 数无关。
+
+    GET_LOCK 是连接级的：连接一断自动释放，所以进程被 SIGKILL 也不会把锁永久
+    留下 —— 这比自己建一张锁表稳妥（锁表方案遇到进程猝死就是个需要人工介入的
+    死锁）。
+
+    拿不到锁时抛异常，由调用方那条既有的"初始化失败就降级"路径接住。宁可某个
+    worker 降级（日志里有 warning），也不要它带着半截 schema 继续写。
+    """
+    conn = await aiomysql.connect(**mysql_connect_kwargs(connect_timeout=3))
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT GET_LOCK(%s, %s)", (LANGGRAPH_SETUP_LOCK, timeout))
+            row = await cur.fetchone()
+        # GET_LOCK 的返回值：1 = 拿到，0 = 超时，NULL = 出错
+        if not row or row[0] != 1:
+            raise RuntimeError(f"等待 {LANGGRAPH_SETUP_LOCK} 锁超时（{timeout}s）")
+        try:
+            yield
+        finally:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT RELEASE_LOCK(%s)", (LANGGRAPH_SETUP_LOCK,))
+    finally:
+        # close() 是同步方法（见 mysql_status 里同样的说明）
+        conn.close()
 
 
 async def mysql_status():
