@@ -118,6 +118,45 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 - Redis 存会话**元数据**（多进程 / 后端重启共享）；磁盘存**重物**（向量库 / 切块 / bm25 pickle）。
 - 冷启动路径：Redis 命中元数据 → 从磁盘重建 → 回填 LRU。重启不丢会话。
 
+### ADR-6：为什么开多 worker（`--workers 2`），以及随之而来的三处"每进程一份"
+
+单进程时所有进程内状态天然只有一份，多开之后必须挨个确认"这东西该不该共享"。盘完分两类：
+
+**该共享的 —— 本来就是外部服务或共享卷，多进程下自动只有一份**
+
+| 状态 | 落在哪 |
+|------|--------|
+| 会话元数据 | Redis |
+| 向量库 / chunks / parent_docs | `faiss_db/` 磁盘（compose 里是共享卷） |
+| 对话记忆（checkpoint） | MySQL |
+| 长期偏好（store） | MySQL |
+
+这四样**没有一个是进程内存**，所以不会出现"这个 worker 记得、那个不记得"。这正是前几步把
+`MemorySaver` / `InMemoryStore` 换成 `AIOMySQLSaver` / `AIOMySQLStore` 的回报 ——
+当时换的理由是"后端重启不丢"，顺带把多进程的前提也备好了。反过来说：**如果没做那两步，
+`--workers 2` 是个纯粹的 bug 制造机**（同一段对话在两个进程里各记一半）。
+
+**不该共享的 —— 每进程一份，也不需要改**
+
+- **连接池**：每个 worker 各建 saver + store 两条，互不干扰。
+- **会话 LRU**：命中率减半。同一个会话被分到另一个 worker 就走"从磁盘重建"的冷路径 ——
+  结果正确，只是慢一次。这是**已知取舍不是缺陷**：要让重建好的图跨进程共享，得引入
+  序列化或外部缓存，收益配不上复杂度。
+- **MCP 子进程**：懒加载，哪个 worker 先接到上传哪个拉起，每个 worker 最多一个。
+
+**实测验证**（`uvicorn --workers 2` 本地真跑，不是 stub）：
+
+- uvicorn 日志里两个**不同**的 `Started server process [pid]`，关停时两个都走到
+  `Application shutdown complete`，关停后残留 `my_mcp_server` 子进程 **0** 个；
+- 库里 `doc_app` 常驻连接 **4** 条（2 进程 × 2 池 × `minsize=1`），关停后归 0；
+- 上传一次 PDF 后连打 40 次 `/api/health`，`checks.mcp` 出现 `not_started` 21 次 +
+  `connected` 19 次 —— **同一个接口两种结果**，一次证明两件事：两个 worker 都在接请求
+  （不是"起了两个只有一个干活"），且进程内状态确实各进程一份。
+
+内存账：一个 worker 载满 embedding + reranker 实测约 **800MB**（框架 439MB + 两个模型
+360MB），两个约 1.6GB。默认取 2 是"多进程真的跑通"的最小验证，不是因为再多跑不动 ——
+改数量不用重建镜像（backend 镜像含 torch，重建很贵），compose 里加一行 `UVICORN_WORKERS=4` 即可。
+
 ---
 
 ## 评测与基线对比
@@ -174,6 +213,7 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 | 联网 | Tavily Search API |
 | 服务 | FastAPI + SSE、Streamlit、MCP（FastMCP） |
 | 记忆 | AIOMySQLSaver（MySQL，多轮对话 checkpoint）+ AIOMySQLStore（MySQL，长期偏好），各用一条独立连接池 |
+| 部署 | Docker Compose（redis / mysql / backend / frontend 四服务）+ uvicorn 多 worker（默认 2，`UVICORN_WORKERS` 可调） |
 | 可观测 | LangSmith 全链路追踪（LLM 调用 / Agent 步骤 / 工具轨迹） |
 | 测试 | pytest（tests/ 目录，离线测试，不联网不烧 token） |
 
@@ -222,6 +262,10 @@ doc-intel/
 │   ├── conftest.py            #   把项目根加入 sys.path
 │   ├── test_config.py         #   路径 / 环境变量体检
 │   ├── test_retriever.py      #   BM25 / 向量检索 / 父子映射
+│   ├── test_auth_health.py    #   鉴权 / 健康检查 / lifespan 建池与降级
+│   ├── test_async_offload.py  #   阻塞操作有没有占住事件循环
+│   ├── test_chat_user_id.py   #   会话与 user_id 的隔离
+│   ├── test_eval_judge.py     #   评估裁判的解析逻辑
 │   └── test_multi_agent_graph.py # 图结构 + Reviewer 行为 + 答案提取
 ├── langgraph.json             # langgraph-cli 配置
 └── faiss_db/                  # 生成的向量索引（勿提交 git）
@@ -297,7 +341,7 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
   "status": "ok",                       // ok | degraded | error
   "checks": {
     "redis":        {"status": "ok", "active_sessions": 3},
-    "session_dir":  {"status": "ok", "path": "faiss_db/sessions"},
+    "session_dir":  {"status": "ok", "path": "/app/faiss_db/sessions"},
     "mcp":          {"status": "not_started"},
     "mysql":        {"status": "ok", "database": "doc_intel"},
     "checkpointer": {"status": "ok", "backend": "mysql"},
@@ -310,6 +354,8 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
 - Redis 或索引目录出问题 → `status: "error"`，HTTP **503**（硬依赖挂了，该把流量摘走）。
 - 只有 MCP 或 MySQL 出问题 → `status: "degraded"`，HTTP 仍是 **200**（MCP 会退回纯本地检索，MySQL 挂了记忆退回进程内存，都不该因此把整个服务判死）。`not_started` 是 MCP 懒加载的正常初始态，不算降级。
 - `checkpointer` 和 `store` 回答的是**各自**的问题，不能互相代表：`mysql` 说"此刻连得上库吗"，这两个说"东西建起来没有"。库活着但表没建起来（比如账号缺 `CREATE` 权限）时就是 `mysql: ok` + 两个都报 `memory` —— 这个组合最能说明问题。两者各用一条独立连接池、各自独立降级，所以"一个成了另一个没成"是真实可能的，健康检查分开报就是为了不把这种半边坏掉的情况掩盖成"一切正常"。
+- `session_dir` 报的是**绝对路径**（以项目根为基准，容器里是 `/app/faiss_db/sessions`，正好落在 compose 的 `./faiss_db:/app/faiss_db` 卷里）。以前它是相对 CWD 的 `faiss_db/sessions`，只在"启动目录恰好是项目根"时才落对地方；启动方式一变（换 `WORKDIR`、systemd、从上级目录 `python -m`）就会静默写到别处 —— 目录照建、读写正常，只是数据在卷外，容器一重建全丢。健康检查把路径打出来，就是为了这种情况能一眼看见。
+- 开了多 worker 后要留意：`mcp` 是**进程内**状态，同一个接口不同请求可能返回不同结果（哪个 worker 接过上传，哪个就是 `connected`，其余是 `not_started`；两个都算正常）。`checkpointer` / `store` 不受影响 —— 它们后端是 MySQL，每个 worker 都连得上。
 
 **接口文档：<http://127.0.0.1:8000/docs>**
 
@@ -341,13 +387,17 @@ python main.py
 
 终端 1 —— 启动后端：
 ```bash
-uvicorn streamlit_1.backend:app --port 8000 --reload
+uvicorn streamlit_1.backend:app --port 8000 --reload     # 开发：单进程，改代码热重载
+uvicorn streamlit_1.backend:app --port 8000 --workers 2  # 多进程：见 ADR-6
 ```
 终端 2 —— 启动前端：
 ```bash
 streamlit run streamlit_1/app.py
 ```
 浏览器打开 `http://localhost:8501`，上传 PDF → 构建索引 → 提问。
+
+> `--reload` 和 `--workers` 互斥，别同时给。多进程下每个 worker 各占约 800MB（模型各载一份），
+> 按机器内存给数量；容器里由 `UVICORN_WORKERS` 控制，默认 2。
 
 ### 5. 跑评估
 

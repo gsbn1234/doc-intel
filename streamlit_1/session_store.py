@@ -32,13 +32,13 @@ import pickle  # 仅用于兼容旧会话 .pkl 的迁移读取
 import threading # 重建跑在线程池里，缓存就成了跨线程共享状态，写入要加锁
 from collections import OrderedDict
 from datetime import datetime
-from pathlib import Path
 
 import redis
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
 from multi_agent.bm25 import create_bm25
+from multi_agent.config import PROJECT_ROOT
 from multi_agent.embedding import get_embeddings
 from multi_agent.llm import get_llm
 from multi_agent.multi_agent_graph import build_multi_agent_graph, load_mcp_tools
@@ -55,7 +55,15 @@ try:
 except redis.ConnectionError:
     logger.error("连不上 Redis（%s:6379），请先在 WSL 里启动：sudo service redis-server start", REDIS_HOST)
 
-SESSIONS_DIR = Path("faiss_db/sessions")  # 会话索引都放这里（faiss_db 已在 .gitignore）
+# 会话索引目录，**绝对路径**（faiss_db 已在 .gitignore）。
+#
+# 原来写的是 Path("faiss_db/sessions")，相对 CWD。它只在"启动目录恰好是项目根"
+# 时才落对地方 —— 容器里靠 WORKDIR /app 侥幸成立，本机靠从根目录启动侥幸成立。
+# 一旦启动方式变了（换 WORKDIR、systemd、从上级目录 `python -m`），它会静默
+# 写到别处：目录照样自动建、照样读写正常，只是数据落在 compose 那个
+# ./faiss_db:/app/faiss_db 挂载点之外 → 容器一重建全丢，而且没有任何报错。
+# 和 config.py 的 FAISS_PATH 共用同一个基准，路径就钉死了。
+SESSIONS_DIR = PROJECT_ROOT / "faiss_db" / "sessions"
 MAX_CACHED = 20                            # 内存最多缓存多少个重建好的会话
 _cache: OrderedDict = OrderedDict()        # session_id -> 重建好的会话字典
 _cache_lock = threading.Lock()             # 保护 _cache 的写入+淘汰（线程池并发调用时）

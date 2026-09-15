@@ -64,6 +64,13 @@ services:
     environment:
       - REDIS_HOST=redis            # 覆盖 session_store.py 默认的 localhost
       - MYSQL_HOST=mysql            # 覆盖 db.py 默认的 localhost；服务名在容器网络里就是域名
+      # 多 worker 数量。这里不写也能跑 —— Dockerfile 的 CMD 里有 ${UVICORN_WORKERS:-2}
+      # 兜底。之所以留成变量而不是写死：backend 镜像要装 torch（数 GB），改一次数字
+      # 就得重建一次，很贵；写成变量后调并发只改这一行、restart 即可。
+      # 开销：每个 worker 各载一份 embedding + reranker，实测约 800MB，按机器内存给。
+      # 前提（ADR-6）：共享状态全在 Redis / MySQL / faiss_db 卷里，进程内 state
+      # 只剩连接池、会话 LRU、MCP 子进程，各一份是预期行为。
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-2}
       - HF_HOME=/hf_cache           # 模型缓存指向挂载的 D 盘
       - HF_HUB_DISABLE_SYMLINKS_WARNING=1
       - HF_HUB_OFFLINE=1            # 模型全走本地缓存，禁联网检查（容器内 HF 被墙 + hub client 已关会报错）
