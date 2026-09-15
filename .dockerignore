@@ -8,6 +8,8 @@ __pycache__
 .env
 .pytest_cache
 faiss_db
+# 已作废（对话记忆改存 MySQL，compose 也不再挂载它），但这个 0 字节的旧文件还留在
+# 工作目录里，留着这行是为了别让它被 COPY 进镜像
 checkpoints.sqlite
 docs
 tests

@@ -1,14 +1,14 @@
-"""MySQL 连接配置与健康探测。
+"""MySQL 连接配置、连接池与健康探测。
 
-为什么单独开一个模块：后端、健康检查、以后可能出现的迁移脚本，都要用同一份连接
-参数。散在各处迟早会出"健康检查连的是 A 库、真正写进去的是 B 库"这种最难查的问题。
+为什么单独开一个模块：后端、健康检查、LangGraph 的 checkpointer / store，都要用
+同一份连接参数。散在各处迟早会出"健康检查连的是 A 库、真正写进去的是 B 库"这种
+最难查的问题 —— 所以参数只在这里拼一次（mysql_connect_kwargs），谁用谁取。
 
-这里只做两件事：拼 DSN、探活。不建连接池、不建表 —— 连接的生命周期归用它的
-LangGraph saver / store 自己管（各自 from_conn_string）。
+三件事：给连接参数、建连接池、探活。建表不在这里做，归用它的 saver / store
+自己 setup()（那是幂等的）。
 """
 
 import os
-from urllib.parse import quote_plus
 
 import aiomysql
 from dotenv import load_dotenv
@@ -31,23 +31,80 @@ MYSQL_USER = os.getenv("MYSQL_USER", "doc_app")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "doc_intel")
 
-# 给 langgraph-checkpoint-mysql / -store 用的 DSN。两个坑，都踩过：
+# 为什么这里不给官方文档推荐的 DSN（saver.from_conn_string("mysql://user:pass@host/db")）：
+# 那条路上有两个静默陷阱，都实测过，都不报错，只会在跑起来之后变成
+# "密码明明是对的却 Access denied"和"字符集其实没设上"。
 #
-#  1. 用户名/密码必须 quote_plus。密码里只要出现 @ : / 之一，不转义就会把 URL
-#     解析带偏，症状是"密码明明是对的却连不上"，很难往这上面想。
+#  1. 密码里的 @ : / % 或空格会让 URL 解析跑偏。按文档调用方得自己 quote_plus
+#     转义，但包内部是用 urlparse(...).password 取回来的，**不做反转义** ——
+#     送进驱动的仍是 "p%40ss" 而不是 "p@ss"，认证直接失败。密码里只要有一个 @
+#     就中招。（顺带：quote_plus 把空格编成 "+"，那是查询串的约定，在 userinfo
+#     段是错的。）
 #
-#  2. 千万别往查询串里加 ?charset=utf8mb4。这个包的 parse_conn_string 走的是
-#     urlparse + parse_qsl，只取 host / user / password / db / port / unix_socket
-#     六个字段，查询串被**静默丢弃** —— 比报错更糟，因为你会以为字符集设上了。
-#     字符集只能在库层面钉死（建库时 CHARACTER SET utf8mb4），所以
-#     docker-compose 的 mysql 服务与本机建库语句都显式指定了。
+#  2. 查询串被整个丢弃。parse_conn_string 走 urlparse + parse_qsl，只取
+#     host / user / password / db / port / unix_socket 六个字段，尾部挂的
+#     ?charset=utf8mb4 不报错也不生效。比报错更糟：你会以为设上了，实际连接用的是
+#     服务端默认字符集，中文写进去迟早出问题 —— 而"迟早"意味着测试阶段大概率
+#     看不出来。
 #
-# 反过来说：我们自己用 aiomysql.connect 开连接时，charset 是真实参数、能生效
-# （见下面 mysql_status）。被丢弃的只是 DSN 那条路径。
-MYSQL_DSN = (
-    f"mysql://{quote_plus(MYSQL_USER)}:{quote_plus(MYSQL_PASSWORD)}"
-    f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
-)
+# 所以这里不拼 DSN，改成把连接参数直接交给驱动：aiomysql 的 charset 是真实参数，
+# 不经任何 URL 编解码，两个坑一起绕开。代价是绕开了官方入口 —— 连接池要传给
+# saver 时只能走 AIOMySQLSaver(conn=pool) 这个鸭子类型接住的非文档化路径
+# （细节和风险见 backend.py 的 _init_checkpointer）。
+#
+# 字符集仍然要在库层面钉死（建库时 CHARACTER SET utf8mb4）：连接参数管的是
+# 这条连接，存进去之后怎么落地是服务端说了算。docker-compose 的 mysql 服务与
+# 本机建库语句都显式指定了。
+
+
+def mysql_connect_kwargs(**overrides):
+    """一份连接参数，健康探测和连接池共用。
+
+    共用是为了堵死"探测连的是 A 库、真正写进去的是 B 库"—— 两边同源，要错
+    一起错，不会出现探测说 ok 而写入失败这种最难查的状态。
+    overrides 给调用方补各自的差异（探测要短超时、池要长超时之类）。
+    """
+    kwargs = {
+        "host": MYSQL_HOST,
+        "port": MYSQL_PORT,
+        "user": MYSQL_USER,
+        "password": MYSQL_PASSWORD,
+        "db": MYSQL_DATABASE,
+        # 字符集只在这条路径上真正生效（见上面注释里的坑 2）
+        "charset": "utf8mb4",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+async def create_mysql_pool(minsize=1, maxsize=5):
+    """建一个 aiomysql 连接池，给 LangGraph 的 saver / store 共用。
+
+    为什么是池，而不是官方文档里的单连接（from_conn_string）：
+
+      单连接那条路是 `async with aiomysql.connect(...)` 攥住一条连接用到底，
+      中间既不 ping 也不重连。MySQL 默认 wait_timeout=28800（8 小时）会把这
+      条空闲连接从服务端单方面掐掉，客户端毫无察觉 —— 表现是服务平稳跑满 8 小时
+      后，所有 checkpoint 写入开始持续失败，且不会自愈，直到进程重启才恢复。
+      这种"上线当天没事、第二天早上开始全挂"的故障最难排查。
+
+      池的 pool_recycle 会在取用连接时按年龄主动丢弃重建（实现见 aiomysql
+      Pool._acquire），这个坑从机制上就消失了。而且 saver 每次读写都是
+      `async with get_connection(...)` 取还一次连接 —— get_connection 对池走的是
+      pool.acquire()/release（见 langgraph .../mysql/_ainternal.py），所以年龄检查
+      每次读写都会跑到，不存在"连接一直没人取、年龄检查不到"的死角。
+
+    maxsize=5 够用：saver 内部有一把 asyncio.Lock 把所有读写串起来，同一时刻最多
+    占一条；余量留给健康探测和以后的 store。
+    """
+    return await aiomysql.create_pool(
+        **mysql_connect_kwargs(),
+        autocommit=True,      # checkpoint 是单语句写入，用不上事务；也让 setup() 的建表立刻生效
+        minsize=minsize,
+        maxsize=maxsize,
+        pool_recycle=3600,    # 1 小时回收一次，离 8 小时的 wait_timeout 留足余量
+        connect_timeout=3,    # 库挂了要快速失败，别把应用启动卡住
+    )
 
 
 async def mysql_status():
@@ -59,13 +116,9 @@ async def mysql_status():
     conn = None
     try:
         conn = await aiomysql.connect(
-            host=MYSQL_HOST,
-            port=MYSQL_PORT,
-            user=MYSQL_USER,
-            password=MYSQL_PASSWORD,
-            db=MYSQL_DATABASE,
-            charset="utf8mb4",      # 这条路径能真正设上（见上面注释里的坑 2）
-            connect_timeout=3,      # 库挂了要立刻返回，探针不能被拖死
+            # 和连接池同一份参数，只把超时改短：探针 3 秒还没通就该报 error，
+            # 让它一直挂着比报错更糟 —— 健康检查自己有超时，会直接判整个探测失败。
+            **mysql_connect_kwargs(connect_timeout=3),
         )
         async with conn.cursor() as cur:
             await cur.execute("SELECT 1")

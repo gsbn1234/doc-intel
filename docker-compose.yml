@@ -18,9 +18,9 @@ services:
   mysql:
     image: mysql:8.0
     restart: unless-stopped
-    # 字符集必须在服务端钉死。langgraph 的 DSN 解析（parse_conn_string）只取
-    # host/user/password/db/port/unix_socket，DSN 查询串里的 ?charset=utf8mb4
-    # 会被静默丢弃 —— 指望 DSN 设字符集是无效的，只能在这里定。
+    # 字符集要在服务端钉死，不能只靠连接参数。连接参数（见 db.py 里 aiomysql 的
+    # charset=utf8mb4）管的是这条连接怎么编解码；真正决定字段怎么落地、索引怎么
+    # 比较的是建库时的字符集。两边都设才算闭环，只设一边的话中文迟早出问题。
     # 顺带：MySQL ≥ 9.6 在生成列里移除了 MD5，而 saver 的 checkpoint_ns_hash
     # 就用了 MD5，且官方没给迁移路径。所以这里锁 8.0，别随手升。
     command:
@@ -69,7 +69,9 @@ services:
       - HF_HUB_OFFLINE=1            # 模型全走本地缓存，禁联网检查（容器内 HF 被墙 + hub client 已关会报错）
     volumes:
       - ./faiss_db:/app/faiss_db                     # 会话索引持久化（上传建好的库）
-      - ./checkpoints.sqlite:/app/checkpoints.sqlite  # 对话记忆（SqliteSaver）
+      # 对话记忆已改用 MySQL（AIOMySQLSaver），落在 mysql_data 卷里，所以原先
+      # ./checkpoints.sqlite 的挂载作废了 —— 留着它只会让 checkpoints.sqlite
+      # 这个 0 字节的旧文件看起来还在起作用，误导排查方向。
       - /mnt/d/AI_CACHE/huggingface:/hf_cache         # 复用 D 盘已下载的模型，不重复下载
     ports:
       - "8000:8000"

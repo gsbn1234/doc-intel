@@ -40,20 +40,70 @@ from multi_agent.bm25 import create_bm25
 from multi_agent.llm import get_llm
 from multi_agent.multi_agent_graph import build_multi_agent_graph, extract_answer, load_mcp_tools, mcp_status, close_mcp
 
+from langgraph.checkpoint.mysql.aio import AIOMySQLSaver
 from langgraph.store.memory import InMemoryStore
 
 store = InMemoryStore()  # 全局唯一长期记忆，跨会话共享（内存版，后端重启即清空）
-# ========== 持久化记忆：SqliteSaver ==========
-# 把对话记忆（checkpoint）存到本地 checkpoints.sqlite 文件，后端重启不丢
-try:
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    _saver_cm = SqliteSaver.from_conn_string("checkpoints.sqlite")#调用静态方法 `from_conn_string()。`"checkpoints.sqlite"`：SQLite 数据库文件名。
-    #文件不存在：自动新建 `checkpoints.sqlite`。文件已存在：打开现有数据库，读取之前保存过的会话记忆
-    # 新版 from_conn_string 返回 context manager，手动 __enter__ 让连接保持到进程结束；
-    # 旧版直接返回 saver 实例，直接用即可
-    checkpointer = _saver_cm.__enter__() if hasattr(_saver_cm, "__enter__") else _saver_cm# #`hasattr(对象,属性名)`：判断对象有没有 `__enter__` 方法。
-except ImportError:
-    checkpointer = None   # 没装 langgraph-checkpoint-sqlite 就退回内存版，不报错
+# ========== 持久化记忆：MySQL checkpointer ==========
+# 对话记忆（checkpoint）落到 MySQL，后端重启不丢、多进程共享同一份。
+#
+# 这里只留一个占位，真正的连接池在 lifespan 启动时才建：建池要 await，
+# 而模块 import 发生在还没有事件循环的时刻，建不了。
+# 值为 None 时 build_multi_agent_graph 内部会自动退回 MemorySaver —— 记忆退化成
+# 进程内存（重启即清空），问答本身照跑。这和 /api/health 把 MySQL 算作软依赖
+# 是同一个判断：连不上库不该让整个服务起不来。
+checkpointer = None
+
+# 注意上面这行 import 特意没包 try/except ImportError。
+# 原来那版 SqliteSaver 是包了的（"没装就退回内存版，不报错"），结果 langgraph-
+# checkpoint-sqlite 从头到尾就没装进依赖里，ImportError 被静默吞掉，于是对话记忆
+# 从来没有真正落过盘（checkpoints.sqlite 一直是 0 字节），而且没有任何症状。
+# 缺依赖是打包错误，不是运行期状况，就该在启动时响亮地炸掉。
+# （包本身可以裸 import：langgraph/checkpoint/mysql/__init__.py 不导驱动，
+#  真正需要 aiomysql 的只有 .aio 子模块，而 aiomysql 已在 requirements 里。）
+
+
+async def _init_checkpointer():
+    """建连接池 + 建表，返回 (saver, pool)；任何失败都返回 (None, None) 并记日志。
+
+    抽成独立函数两个原因：
+      · lifespan 里只剩三行，启动/关停的资源一眼能看全；
+      · 单测能整体替换掉它 —— 否则每个跑 lifespan 的用例都得去连一个真 MySQL。
+
+    失败不往外抛：MySQL 是软依赖（判定见 /api/health），连不上只该让记忆退化成
+    进程内存，不该让整个服务起不来。但也不能一声不吭 —— 记 warning，让"记忆没持久化"
+    这件事在日志里留痕。
+    """
+    pool = None
+    try:
+        pool = await create_mysql_pool()
+        # 官方入口是 AIOMySQLSaver.from_conn_string(DSN)，这里走的是
+        # AIOMySQLSaver(conn=pool) —— 这条路没写在文档里，靠的是包内部对连接的
+        # 鸭子类型判断（_ainternal.get_connection：有 acquire 当池用，有 cursor
+        # 当单连接用）。所以它不是公开 API，升级 langgraph-checkpoint-mysql 时
+        # 要重新确认一遍。
+        # 换来的东西值这个风险：绕开 DSN 的密码转义与字符集两个静默坑，
+        # 且没有单连接 8 小时空闲被服务端掐断的问题（理由见 db.create_mysql_pool）。
+        saver = AIOMySQLSaver(conn=pool)
+        # 建表是 CREATE TABLE IF NOT EXISTS，幂等，每次启动都可以安全跑一遍。
+        # 它跑的是内置的迁移脚本，顺带会把 schema 升到当前包版本要求的样子。
+        #
+        # 每次启动都会看到一行 SQL 告警 "Table 'checkpoint_migrations' already
+        # exists"（MySQL 1050），由 aiomysql 的 cursor 转成 Python warning 打到
+        # stderr。这是 IF NOT EXISTS 命中已有表的正常结果，不是错误 —— 只有第一次
+        # 启动的库才不会有。这里刻意不去 filter 掉它：告警文案随 MySQL 版本变，
+        # 按文案正则过滤很脆，而且会把 setup() 真正该报的 DDL 告警一起吞掉。
+        await saver.setup()
+    except Exception as e:
+        logger.warning(
+            "MySQL 初始化失败，对话记忆退回进程内存（重启即清空）：%s: %s",
+            type(e).__name__, e,
+        )
+        if pool is not None:
+            pool.close()
+            await pool.wait_closed()
+        return None, None
+    return saver, pool
 
 
 # ========== 应用生命周期 ==========
@@ -70,13 +120,38 @@ except ImportError:
 # 这正是 on_event 装饰器写法最容易踩的坑——它是"后注册"，所以能写在 app 之后。
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 这个 global 不能省：checkpointer 是模块级那一个，/api/chat-stream 建图、
+    # get_session 重建会话、/api/health 报状态三处都读它。不声明的话下面那行只是
+    # 在函数内新建一个同名局部变量，外面永远看不到 —— 症状是"池都建好了、
+    # 日志也说连上了，记忆却还是重启就丢"，很难往作用域上想。
+    global checkpointer
+
     # ---- 启动 ----
-    # 这里目前没有要预热的：MCP 是懒加载的（等第一个带 domain 的会话来才拉起子进程），
-    # 模型和 Redis 连接都在各自模块 import 时就绪。留一行日志是为了在日志里
-    # 标出进程重启的边界——排查"重启后第一次提问为什么慢"时能一眼看到分界。
+    # 留这行日志是为了在日志里标出进程重启的边界——排查"重启后第一次提问
+    # 为什么慢"时能一眼看到分界。
     logger.info("后端启动：接口 %s", "已鉴权" if API_KEY else "无鉴权（本地开发）")
+    # 建连接池 + 建表。放在这里而不是 import 时，是因为它要 await，而模块 import
+    # 发生在还没有事件循环的时刻。MCP 仍是懒加载的（等第一个带 domain 的会话
+    # 才拉起子进程），这里不等它。
+    checkpointer, _mysql_pool = await _init_checkpointer()
+    # 排查"重启后对话记忆还在不在"的第一现场：说 MySQL 就是持久化的；说进程内存
+    # 就说明上面那步失败了（具体原因在紧随其前的 warning 里）。
+    logger.info(
+        "对话记忆：%s", "MySQL（重启不丢）" if checkpointer else "进程内存（重启即清空）"
+    )
     yield
     # ---- 关停 ----
+    # 先收连接池：close() 是同步方法，只负责标记关闭、唤醒还等在 acquire 上的协程；
+    # 真正的"连接都还回来了"要 await wait_closed()。少了它会留一批连接挂在
+    # MySQL 侧，要等服务端自己的超时才清掉。
+    if _mysql_pool is not None:
+        _mysql_pool.close()
+        await _mysql_pool.wait_closed()
+    # 置回 None：池已经关了，再留着这个 saver 就是指向已关闭资源的悬空引用。
+    # （单测里同一个进程会多次进出 lifespan，不复位的话第二次跑就开始报
+    # "Cannot acquire connection after closing pool"，而错误现场在 saver 里，
+    # 看不出根因是上一轮没清干净。）
+    checkpointer = None
     # 关掉全局 MCP 子进程。不关的话它会挂在 asyncio 的事件循环清理上，
     # 退出时刷一堆噪音错误，盖掉真正的报错。
     await close_mcp()
@@ -143,7 +218,7 @@ async def verify_api_key(
 from streamlit_1.session_store import (
     save_session, get_session, delete_session, redis_status, SESSIONS_DIR,
 )
-from streamlit_1.db import mysql_status
+from streamlit_1.db import mysql_status, create_mysql_pool
 
 
 # ========== 请求/响应模型 ==========
@@ -505,7 +580,20 @@ async def health(response: Response):
         # 异步函数（走 aiomysql），阻塞 IO 由驱动自己在事件循环里等。
         # 包一层 to_thread 反而会把 coroutine 对象丢进线程池，拿不到结果。
         "mysql": await mysql_status(),
-        "checkpointer": {"status": "ok" if checkpointer else "disabled"},
+        # 只读 lifespan 建好的那个全局，不在这里建连接 —— 健康检查不该有副作用。
+        # 注意它和上面 mysql 探针回答的是两个不同的问题：mysql 说"此刻连得上库吗"，
+        # 这里说"checkpointer 到底建起来没有"。库活着但建表失败（比如账号缺
+        # CREATE 权限）时，前者 ok、后者 memory —— 正是这个组合最能说明问题。
+        # 这两种状态都不参与下面的 overall 判定：MySQL 是软依赖，
+        # 退化成进程内存只是记忆重启即丢，问答照跑，不该把整个服务判死。
+        "checkpointer": (
+            {"status": "ok", "backend": "mysql"}
+            if checkpointer is not None
+            else {
+                "status": "memory",
+                "detail": "MySQL 不可用或建表失败，对话记忆退化为进程内存（重启即清空）",
+            }
+        ),
     }
 
     overall = "ok"

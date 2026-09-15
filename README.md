@@ -33,7 +33,7 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 - **多 Agent 协作**：Supervisor（调度）→ Researcher（本地库 + 联网搜索）→ Writer（成文）→ Reviewer（质量审核，不合格自动打回重搜），各节点各司其职，上下文互不污染
 - **混合检索**：child 小块（200 字符）上做 FAISS + BM25 混合，映射回 parent 大块（800 字符），搜得准且上下文完整
 - **检索增强**：Query Rewrite、Multi-Query、HyDE、CrossEncoder Rerank、Context Compression 全链路
-- **长期记忆**：LangGraph Store 记住用户偏好（"记住…"），SqliteSaver 持久化多轮对话 checkpoint
+- **长期记忆**：LangGraph Store 记住用户偏好（"记住…"），MySQL 持久化多轮对话 checkpoint（AIOMySQLSaver）
 - **MCP 扩展**：Researcher 可调用自定义 MCP Server 工具
 - **流式输出**：SSE（Server-Sent Events）实时推送搜索状态、工具调用和最终答案
 - **可评估**：LLM-as-Judge 三维度（Context Recall / Faithfulness / Answer Relevancy）评测脚本
@@ -173,7 +173,7 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 | 检索 | FAISS 向量库、rank_bm25、jieba 中文分词 |
 | 联网 | Tavily Search API |
 | 服务 | FastAPI + SSE、Streamlit、MCP（FastMCP） |
-| 记忆 | LangGraph Store（InMemory）、SqliteSaver（checkpoints.sqlite） |
+| 记忆 | LangGraph Store（InMemory）、AIOMySQLSaver（MySQL checkpoint，多轮对话持久化） |
 | 可观测 | LangSmith 全链路追踪（LLM 调用 / Agent 步骤 / 工具轨迹） |
 | 测试 | pytest（tests/ 目录，离线测试，不联网不烧 token） |
 
@@ -377,7 +377,7 @@ python eval_baseline.py       # 三档基线对比（无检索 vs 单路 vs 完�
 
 - **换目录跑就报错 / 找不到 docs**：所有路径统一在 `multi_agent/config.py` 中按项目根计算，请勿自行硬编码相对路径。
 - **faiss_db 索引过期**：`docs/` 内容更新后需删除 `faiss_db/` 重新建索引（目前索引按"存在即复用"策略，暂未自动校验文档变更）。
-- **对话记忆重启丢失**：默认 `checkpoints.sqlite` 持久化 checkpoint；长期偏好记忆用的是内存 Store，重启即清空。
+- **对话记忆重启丢失**：多轮对话 checkpoint 存在 **MySQL** 里（`AIOMySQLSaver`，建表在启动时由 `setup()` 自动完成），后端重启不丢。若启动时连不上 MySQL 或建表失败，会**降级**为进程内存（重启即清空）并在日志里留 warning，此时 `/api/health` 的 `checkpointer` 会如实报 `{"status": "memory"}` 而不是笼统的 ok —— 库活着但账号缺 `CREATE` 权限就正好是这个组合。长期偏好记忆用的是内存 Store，重启即清空。
 
 ---
 

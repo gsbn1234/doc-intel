@@ -14,9 +14,12 @@
   · Redis / 索引目录挂了 → 503；MCP 或 MySQL 出问题 → degraded 但仍是 200
     （软依赖挂了不代表服务不能干活，判 503 反而会让编排系统误摘流量）
   · 关停时真的会去 close_mcp（这类钩子漏挂平时没症状，只有退出时才看得出来）
+  · 对话记忆的 MySQL checkpointer：建起来了要收池、要复位全局；建不起来只降级
+    （不抛异常、不泄漏池），健康检查里如实报 memory 而不是笼统的 ok
 
 不碰网络、不碰真 Redis：外部依赖全换成桩。
 """
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -267,7 +270,13 @@ def test_shutdown_closes_mcp():
     async def fake_close():
         called.append(True)
 
-    with patch.object(backend, "close_mcp", fake_close):
+    # lifespan 里除了关 MCP，还会去建 MySQL 连接池。这里替换掉那一步：这个用例
+    # 只管 MCP，不该因为跑测试的机器上没 MySQL 就红，也不该白等 3 秒连接超时。
+    async def no_mysql():
+        return None, None
+
+    with patch.object(backend, "close_mcp", fake_close), \
+         patch.object(backend, "_init_checkpointer", no_mysql):
         with TestClient(backend.app):
             pass
     assert called, "关停时没关 MCP 子进程——它会挂在事件循环清理上刷噪音错误"
@@ -351,3 +360,118 @@ def test_health_omits_absent_fields_instead_of_nulling_them(tmp_path):
     assert body["checks"]["redis"] == {"status": "ok", "active_sessions": 2}
     assert "detail" not in body["checks"]["redis"]
     assert "path" not in body["checks"]["mcp"]
+
+
+# ========== 五、对话记忆（MySQL checkpointer 接线） ==========
+#
+# 这一节的背景是一个存在了很久、且完全没有症状的真实缺陷：原来的 SqliteSaver
+# 是用 try/except ImportError 兜底的，而 langgraph-checkpoint-sqlite 从头到尾
+# 没进过依赖 —— ImportError 被静默吞掉，checkpointer 永远是 None，对话记忆
+# 一次都没落过盘（checkpoints.sqlite 一直是 0 字节）。
+# 所以这里锁死的除了"能建起来"，还有"建不起来时要留痕、要收干净、且不拖垮启动"。
+
+class _FakePool:
+    """假连接池，只记 close / wait_closed 有没有被调到。"""
+
+    def __init__(self):
+        self.closed = False
+        self.waited = False
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        self.waited = True
+
+
+def _stub_init(saver, pool):
+    """替掉 backend._init_checkpointer 的桩：直接给固定的 (saver, pool)。"""
+    async def _init():
+        return saver, pool
+
+    return _init
+
+
+def test_lifespan_creates_checkpointer_and_closes_pool():
+    """启动时把模块级 checkpointer 指向 MySQL saver；关停时收池并复位全局。
+
+    复位那一步最容易漏：同一个进程里会反复进出 lifespan，不复位的话第二次
+    拿到的就是指向已关闭池的悬空 saver（报错现场在 saver 里，看不出根因）。
+    """
+    saver, pool = object(), _FakePool()
+
+    with patch.object(backend, "_init_checkpointer", _stub_init(saver, pool)):
+        with TestClient(backend.app):
+            assert backend.checkpointer is saver, (
+                "启动后全局 checkpointer 没指向 MySQL saver——"
+                "多半是 lifespan 里漏了 `global checkpointer`，赋值落到局部变量上了"
+            )
+        assert pool.closed, "关停时没关连接池"
+        assert pool.waited, "close() 只是标记关闭，必须 await wait_closed() 才算收完"
+
+    assert backend.checkpointer is None, "关停后没复位，留下指向已关闭池的悬空引用"
+
+
+def test_init_checkpointer_degrades_when_mysql_unreachable():
+    """MySQL 连不上只降级、不抛异常：软依赖挂了不该让整个服务起不来。"""
+    async def boom():
+        raise OSError("connection refused")
+
+    with patch.object(backend, "create_mysql_pool", boom):
+        saver, pool = asyncio.run(backend._init_checkpointer())
+
+    assert (saver, pool) == (None, None), (
+        "建池失败时该返回 (None, None)，让 build_multi_agent_graph 退回 MemorySaver"
+    )
+
+
+def test_init_checkpointer_closes_pool_when_setup_fails():
+    """池建成了但建表失败：池必须收掉，不能泄漏。
+
+    最容易出的岔子是把 setup() 的异常直接抛出去 —— 应用没起来，池却已经建好
+    且没人收，连接就这么挂在 MySQL 上直到服务端超时。
+    """
+    pool = _FakePool()
+
+    async def fake_create_pool():
+        return pool
+
+    class _BadSaver:
+        def __init__(self, conn=None):
+            assert conn is pool, "saver 必须拿到建好的那个池"
+
+        async def setup(self):
+            raise RuntimeError("CREATE TABLE 被拒（账号缺 CREATE 权限）")
+
+    with patch.object(backend, "create_mysql_pool", fake_create_pool), \
+         patch.object(backend, "AIOMySQLSaver", _BadSaver):
+        saver, got_pool = asyncio.run(backend._init_checkpointer())
+
+    assert (saver, got_pool) == (None, None)
+    assert pool.closed and pool.waited, "建表失败后池没被收掉，连接泄漏了"
+
+
+def test_health_tells_apart_mysql_probe_and_checkpointer(monkeypatch):
+    """mysql 探针说 ok、checkpointer 说 memory —— 这个组合最能说明问题：
+    库是活的，但表没建起来（比如账号缺 CREATE 权限）。两个字段必须各说各的。
+
+    同时锁死：checkpointer 退化不参与 overall 判定。记忆退回进程内存只是
+    重启即丢，问答照跑，不该把整个服务判成 degraded/error。
+    """
+    monkeypatch.setattr(backend, "checkpointer", None)
+    body = _health(redis={"status": "ok", "active_sessions": 1},
+                   mcp={"status": "connected"}).json()
+
+    assert body["checks"]["mysql"]["status"] == "ok"
+    assert body["checks"]["checkpointer"]["status"] == "memory"
+    assert "detail" in body["checks"]["checkpointer"], "退化时要说明退到哪去了"
+    assert body["status"] == "ok", "checkpointer 退化不该影响 overall"
+
+
+def test_health_reports_mysql_backed_checkpointer(monkeypatch):
+    """checkpointer 建起来时，状态要明确说是 MySQL 撑的，而不是笼统的 ok。"""
+    monkeypatch.setattr(backend, "checkpointer", object())
+    body = _health(redis={"status": "ok", "active_sessions": 1},
+                   mcp={"status": "connected"}).json()
+
+    assert body["checks"]["checkpointer"] == {"status": "ok", "backend": "mysql"}
