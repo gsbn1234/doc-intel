@@ -136,6 +136,10 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 当时换的理由是"后端重启不丢"，顺带把多进程的前提也备好了。反过来说：**如果没做那两步，
 `--workers 2` 是个纯粹的 bug 制造机**（同一段对话在两个进程里各记一半）。
 
+> ⚠️ 但这一段推论当时**漏了一问**，全栈 compose 验证时真的翻了车 —— 四样状态确实都在
+> MySQL，可 `AIOMySQLSaver` 的**初始化**失败了，而降级目标恰恰是进程内存。详见本节末尾的
+> 「补充」。
+
 **不该共享的 —— 每进程一份，也不需要改**
 
 - **连接池**：每个 worker 各建 saver + store 两条，互不干扰。
@@ -156,6 +160,48 @@ CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streaml
 内存账：一个 worker 载满 embedding + reranker 实测约 **800MB**（框架 439MB + 两个模型
 360MB），两个约 1.6GB。默认取 2 是"多进程真的跑通"的最小验证，不是因为再多跑不动 ——
 改数量不用重建镜像（backend 镜像含 torch，重建很贵），compose 里加一行 `UVICORN_WORKERS=4` 即可。
+
+#### 补充：多 worker 的坑不在"状态存哪"，在"谁来初始化"（全栈 compose 验证时补记）
+
+上面那张表回答的是**状态存在哪**。它漏问了第二个问题：**N 个进程怎么收敛到同一份共享存储上**。
+答案是四个字：各自跑一遍 `setup()`。于是开局就撞车 ——
+
+```
+两个 worker 同时启动，各自执行 AIOMySQLSaver.setup()：
+  CREATE TABLE IF NOT EXISTS ...         ← 幂等，没事
+  INSERT INTO checkpoint_migrations (0)  ← 不幂等！两个进程同时读到"版本表为空"，
+                                           同时 INSERT，晚的那个撞主键
+→ IntegrityError (1062, "Duplicate entry '0' for key 'checkpoint_migrations.PRIMARY'")
+→ 被 _init_checkpointer 的兜底 except 接住 → 那个 worker 静默降级成进程内存
+```
+
+症状是**行为分裂**而不是报错：容器起来后连打 30 次 `/api/health`，**28 次**报
+`checkpointer={"status":"ok","backend":"mysql"}`、**2 次**报 `{"status":"memory"}`。
+落到那个 worker 上的请求，对话记忆重启就丢；而且每次重启丢的是哪个 worker 还是**随机的**。
+
+本机从没暴露过 —— 单 worker 时这个交错不可能发生，它是 `--workers 2` **引进来的**。
+更值得记的是：**这个 bug 正好推翻了上面那段"四样都不在进程内存，所以不会分裂"的推论。**
+四样的确都在 MySQL，但初始化失败后，降级目标恰恰是进程内存。**"状态存在哪"和"状态实际
+落在哪"是两回事** —— 中间隔着一条初始化路径。
+
+修法是 `db.langgraph_setup_lock()`：用 MySQL 咨询锁（`GET_LOCK`）把 `setup()` 串起来。
+两个设计点值得记：
+
+- **锁连接独占，不从连接池里取。** 从池里取会死锁：N 个 worker 各占一条连接在 `GET_LOCK`
+  上排队，池一满，拿到锁的那个也借不到连接去真正跑 `setup()`，只能等锁超时。独占一条
+  临时连接，占用就与池容量、worker 数都无关。
+- **`GET_LOCK` 是连接级的**，连接一断自动释放。所以进程被 SIGKILL 也不会留下永久锁 ——
+  比自己建一张锁表稳妥（锁表方案遇到进程猝死就是个要人工介入的死锁）。
+
+修后实测 30/30 一致。同一次验证还顺带查出另一处：writer 节点在 **async 函数里同步调**
+`store.get()`，而 `AIOMySQLStore` 的同步 `get` 内部是
+`run_coroutine_threadsafe(self.aget(...), store._loop).result()` —— 在事件循环线程上等一个
+丢给同一个循环的协程，**真死锁**（langgraph 的 `_check_loop` 会拦下来抛 `InvalidStateError`，
+否则就是挂住）。单测全走 `InMemoryStore`，同步调用完全正常，所以这条路一直没被跑到。改成
+`await store.aget(...)` 即可。
+
+**把这条推广一下**：多进程化要问两遍 —— ① 状态存在哪；② **谁负责把它初始化成可用的样子，
+N 个进程之间怎么不打架**。第二问对"建表 / 迁移 / 注册 / 预热"这类**只该做一次**的动作都成立。
 
 ---
 
