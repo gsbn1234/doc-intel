@@ -306,6 +306,14 @@ def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:B
     if "记住" in question:
         pref = question.split("记住", 1)[-1].strip("：:，。、 ")#从字符串只分割 1 次。`[-1]`：取分割后**最后那一段**，也就是 “记住” 后面所有文字
         if pref:#`("users", user_id)` → namespace 命名空间，相当于文件夹：users 目录下，该用户的记忆。`"style"` → key，记忆条目的名字，代表「回答风格偏好」。`{"data": pref}` → 要保存的值，必须是字典格式
+            # 这里**故意**保持同步的 store.put，不是漏改 —— 和 writer 那边相反。
+            # 本节点是同步函数（见下面的 def），LangGraph 会把同步节点丢进线程池执行，
+            # 那条线程上没有运行中的事件循环，_check_loop 只拦"当前 loop 就是 store
+            # 自己那个 loop"的情况（store/base/batch.py:33），所以这里放行，
+            # run_coroutine_threadsafe 借用主循环把写入跑完，语义正确。
+            # 把它改成 await store.aput(...) 反而要先把节点改成 async，那样里面
+            # rewrite_query(question, llm) 这个阻塞 LLM 调用就落到事件循环上了 ——
+            # 得不偿失（项目对"阻塞活别占事件循环"的要求见 tests/test_async_offload.py）。
             store.put(("users", user_id), "style", {"data": pref})
             logger.info("[Memory] 已记住用户偏好：%s", pref[:80])
 
@@ -465,7 +473,21 @@ async def writer_agent_node(state: MultiAgentState, llm,config:RunnableConfig,st
 
     # 长期记忆：读用户偏好，注入为一条 system 消息（插在最前）
     user_id = config.get("configurable", {}).get("user_id", "anonymous")
-    pref = store.get(("users", user_id), "style")
+    #
+    # 必须是 aget 不能是 get —— 这个节点是 async 的，跑在事件循环线程上，
+    # 而 store 若是 AIOMySQLStore，同步 get 内部是
+    # `run_coroutine_threadsafe(self.aget(...), store._loop).result()`：
+    # 在事件循环线程里等"丢给同一个循环的协程"，循环被自己堵死，任务永远排不上，
+    # 直接死锁。langgraph 的 _check_loop 就是拦这个的（store/base/batch.py:33），
+    # 抛 InvalidStateError 而不是让你挂住。
+    #
+    # 实测：Step 1-3 把 store 从 InMemoryStore 换成 AIOMySQLStore 之后，这个同步调用
+    # 没被任何单测碰到（单测走的是内存 store，同步调用完全正常），直到容器里跑
+    # 第一次真实对话才炸：SSE 推回 error 事件、这一轮没有答案。
+    #
+    # InMemoryStore 也有 aget（BaseStore 的默认实现，走 abatch），所以降级到内存
+    # store 时同样安全 —— 改完两条路都对。
+    pref = await store.aget(("users", user_id), "style")
     if pref is not None and pref.value.get("data"):
         messages = [SystemMessage(content=f"用户偏好：{pref.value['data']}。请严格按此偏好组织回答。")] + messages
 
