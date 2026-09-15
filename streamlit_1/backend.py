@@ -470,7 +470,7 @@ async def chat_stream(req: ChatRequest):
       {"type": "done",         "answer": "最终回答..."}  # 终稿，覆盖流式拼出的内容
       {"type": "error",        "message": "..."}
     """
-    #Pydantic 模型 — ChatRequest 类（第 49-51 行）自动校验请求体。如果前端少传了 session_id 或类型不对，FastAPI 自动返回 422 错误，不需要手写校验逻辑。
+    #Pydantic 模型 — ChatRequest 自动校验请求体。如果前端少传了 session_id 或类型不对，FastAPI 自动返回 422 错误，不需要手写校验逻辑。
     if not req.question or len(req.question) > 2000:
         raise HTTPException(status_code=400, detail="问题为空或超过 2000 字")
     # 从 Redis 取会话：内存缓存没命中 → 按 Redis 元数据从磁盘重建（async）
