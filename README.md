@@ -204,6 +204,8 @@ doc-intel/
 │   └── llm.py                 #   DeepSeek 实例
 ├── streamlit_1/
 │   ├── backend.py             # FastAPI 后端（上传 / 流式对话 / 健康检查）
+│   ├── session_store.py       # 会话元数据（Redis）+ 索引目录管理
+│   ├── db.py                  # MySQL 连接配置 / DSN / 健康探测
 │   └── app.py                 # Streamlit 前端
 ├── mcp_tools/                 # 自定义 MCP Server（领域化工具注册）
 │   ├── registry.py            #   领域 → 工具白名单（ai_learning/general/...）
@@ -251,6 +253,12 @@ TAVILY_API_KEY=你的TavilyKey
 LANGSMITH_API_KEY=可选
 LANGSMITH_TRACING=false
 BACKEND_API_KEY=可选，见下
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=doc_app
+MYSQL_PASSWORD=
+MYSQL_DATABASE=doc_intel
+MYSQL_ROOT_PASSWORD=
 ```
 
 **`BACKEND_API_KEY`（后端接口鉴权）**
@@ -266,6 +274,22 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
   缺 Key 或 Key 错误统一返回 `401`。
 - 前端 `streamlit_1/app.py` 读的是**同一个变量名**，`docker-compose.yml` 里已给 frontend 服务注入，本地跑时两个进程都要能看到这个变量（同一个 `.env` 即可）。
 
+**`MYSQL_*`（对话记忆持久化）**
+
+把 LangGraph 的对话记忆与长期记忆落到 MySQL。**不配也能跑**——连不上只在健康检查里报 `degraded`（HTTP 仍是 200），问答不受影响。
+
+- 本机直跑时用上表默认值（`localhost:3306`）。首次需要自己建库和账号，字符集必须当场钉死：
+  ```sql
+  CREATE DATABASE doc_intel CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+  CREATE USER 'doc_app'@'localhost' IDENTIFIED BY '<MYSQL_PASSWORD 的值>';
+  GRANT ALL PRIVILEGES ON doc_intel.* TO 'doc_app'@'localhost';
+  ```
+  不用 root 跑应用，也**不要**图省事授权到 `*.*`——`doc_app` 只需要 `doc_intel` 这一个库。
+  为什么不能省字符集：LangGraph 的 DSN 解析（`parse_conn_string`）只取 `host/user/password/db/port/unix_socket`，DSN 里写 `?charset=utf8mb4` 会被**静默丢弃**——比报错更麻烦，因为你会以为设上了。同理，容器里由 `--character-set-server` 在服务端指定。
+- `MYSQL_ROOT_PASSWORD` **只给 docker compose 用**（本机直跑不读它），且**必须与 `MYSQL_PASSWORD` 不同**：两者同源的话，应用凭据一泄露 root 也跟着泄露。它没有默认值，没配就让 compose 当场报错，而不是悄悄退化成一个更弱的配置。
+- `docker compose` 起时，`MYSQL_HOST` 被 compose 覆盖成服务名 `mysql`，`.env` 里的值不生效。MySQL 容器**不对宿主机暴露 3306**（`docker compose exec mysql mysql -uroot -p` 进去调试）。
+- 版本锁在 **MySQL 8.0**：`mysql:8.0`。MySQL ≥ 9.6 在生成列中移除了 `MD5`，而 saver 的 `checkpoint_ns_hash` 正是用 `MD5` 生成列，官方未提供迁移路径——不要随手升级镜像 tag。
+
 `GET /api/health` **不需要鉴权**——探活方（Docker healthcheck、k8s 探针、负载均衡）手里没有凭据，要鉴权的话探针永远是 401。它逐个报告依赖：
 
 ```json
@@ -275,6 +299,7 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
     "redis":        {"status": "ok", "active_sessions": 3},
     "session_dir":  {"status": "ok", "path": "faiss_db/sessions"},
     "mcp":          {"status": "not_started"},
+    "mysql":        {"status": "ok", "database": "doc_intel"},
     "checkpointer": {"status": "ok"}
   },
   "active_sessions": 3
@@ -282,7 +307,7 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
 ```
 
 - Redis 或索引目录出问题 → `status: "error"`，HTTP **503**（硬依赖挂了，该把流量摘走）。
-- 只有 MCP 出问题 → `status: "degraded"`，HTTP 仍是 **200**（工具降级会自动退回纯本地检索，不该因此把整个服务判死）。`not_started` 是懒加载的正常初始态，不算降级。
+- 只有 MCP 或 MySQL 出问题 → `status: "degraded"`，HTTP 仍是 **200**（MCP 会退回纯本地检索，MySQL 挂了记忆退回进程内存，都不该因此把整个服务判死）。`not_started` 是 MCP 懒加载的正常初始态，不算降级。
 
 **接口文档：<http://127.0.0.1:8000/docs>**
 

@@ -1,5 +1,6 @@
-# 第 7 步：Docker 一键部署。三个服务：
+# 第 7 步：Docker 一键部署。四个服务：
 #   redis    —— 会话元数据（独立容器，backend 通过 REDIS_HOST=redis 连）
+#   mysql    —— 对话记忆 / 长期记忆持久化（LangGraph checkpoint + store）
 #   backend  —— FastAPI(8000)：Agent-RAG 核心
 #   frontend —— Streamlit(8501)：网页，BACKEND_URL=http://backend:8000 调后端
 services:
@@ -14,6 +15,46 @@ services:
       timeout: 3s
       retries: 5
 
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    # 字符集必须在服务端钉死。langgraph 的 DSN 解析（parse_conn_string）只取
+    # host/user/password/db/port/unix_socket，DSN 查询串里的 ?charset=utf8mb4
+    # 会被静默丢弃 —— 指望 DSN 设字符集是无效的，只能在这里定。
+    # 顺带：MySQL ≥ 9.6 在生成列里移除了 MD5，而 saver 的 checkpoint_ns_hash
+    # 就用了 MD5，且官方没给迁移路径。所以这里锁 8.0，别随手升。
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      # root 密码与应用账号密码必须分开，所以是两个变量。两者同源的话，
+      # 应用凭据一泄露 root 也跟着泄露。故意不给默认值：没配就让 compose
+      # 当场报错，而不是悄悄退化成一个更弱的配置。
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置：请在 .env 里给 root 一个与应用账号不同的密码}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-doc_intel}
+      # 这两行不能省：后端在容器里是用 doc_app 连的（env_file 注入），
+      # 只给 root 密码的话镜像不会建这个账号，后端会一直 Access denied。
+      # 镜像的 entrypoint 会建 'doc_app'@'%' 并授权到 MYSQL_DATABASE，
+      # 正好覆盖"容器 IP 不是 localhost"这件事（本机那套建的是 @'localhost'）。
+      - MYSQL_USER=${MYSQL_USER:-doc_app}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:?MYSQL_PASSWORD 未设置，请在 .env 里配置}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    # 刻意没有 ports: —— 不向宿主机暴露 3306。
+    #   ① 后端在 compose 网络里用服务名 mysql 直连，本来就不需要走宿主机端口；
+    #   ② 3306 一旦映射出去，Docker 的 -p 会绕过 ufw 直接对外可达，而这个库
+    #      最薄弱的环节就是那一个密码。要进去调试用：
+    #        docker compose exec mysql mysql -uroot -p
+    #   ③ 本机开发走的是宿主机自己的 MySQL 8.0（localhost:3306），两条路互不干扰。
+    healthcheck:
+      # 用 $$ 转义，让 $MYSQL_ROOT_PASSWORD 在容器内展开，密码不落到 compose 文件里。
+      # mysqladmin ping 只证明 mysqld 活着、不接受连接之外的检查，够用了。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s             # 首次启动要初始化数据目录再建库，给足时间
+
   backend:
     build:
       context: .
@@ -22,6 +63,7 @@ services:
     env_file: .env                  # secrets 运行期注入，不打进镜像
     environment:
       - REDIS_HOST=redis            # 覆盖 session_store.py 默认的 localhost
+      - MYSQL_HOST=mysql            # 覆盖 db.py 默认的 localhost；服务名在容器网络里就是域名
       - HF_HOME=/hf_cache           # 模型缓存指向挂载的 D 盘
       - HF_HUB_DISABLE_SYMLINKS_WARNING=1
       - HF_HUB_OFFLINE=1            # 模型全走本地缓存，禁联网检查（容器内 HF 被墙 + hub client 已关会报错）
@@ -32,7 +74,7 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      # /api/health 会真去 ping Redis、看索引目录、读 MCP 状态；
+      # /api/health 会真去 ping Redis、查 MySQL、看索引目录、读 MCP 状态；
       # Redis 挂了它返 503，这里就跟着 unhealthy，编排系统能把流量摘走。
       # 为什么用 python 而不是 curl：backend 镜像里没装 curl，python 一定有。
       # urlopen 遇到非 2xx 会抛异常，所以"没抛"就等于 200，不用再判一次状态码。
@@ -44,6 +86,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      mysql:
+        condition: service_healthy    # 等建库完成，否则首次启动会连续报连不上库
 
   frontend:
     build:
@@ -63,3 +107,4 @@ services:
 
 volumes:
   redis_data:
+  mysql_data:

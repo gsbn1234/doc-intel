@@ -143,6 +143,7 @@ async def verify_api_key(
 from streamlit_1.session_store import (
     save_session, get_session, delete_session, redis_status, SESSIONS_DIR,
 )
+from streamlit_1.db import mysql_status
 
 
 # ========== 请求/响应模型 ==========
@@ -486,8 +487,9 @@ async def health(response: Response):
       · 不鉴权 —— 探活方（k8s liveness/readiness、Docker healthcheck、负载均衡）
         手里没有凭据，要鉴权的话探针永远是 401，探测就失去意义。
       · 状态码分两档 —— Redis 是硬依赖（会话元数据全在里面），挂了返 503，
-        让编排系统把流量摘走；MCP 只是工具降级（连不上会退回纯本地检索），
-        标 degraded 但仍是 200，不该因为一个可选组件把整个服务判死。
+        让编排系统把流量摘走；MCP 和 MySQL 只是降级（MCP 连不上会退回纯本地
+        检索，MySQL 连不上则记忆暂时退回进程内存），标 degraded 但仍是 200，
+        不该因为一个可选组件把整个服务判死。
       · 探测函数自己吞异常并返回状态 —— 健康检查的职责是"报告"，把异常抛出去
         调用方只会拿到 500 堆栈，看不出到底哪个组件出问题。
     """
@@ -499,15 +501,20 @@ async def health(response: Response):
             else {"status": "error", "detail": f"目录不存在：{SESSIONS_DIR}"}
         ),
         "mcp": mcp_status(),          # 只读全局状态，不主动拉起子进程
+        # 注意这里是直接 await，没裹 asyncio.to_thread：mysql_status 本身就是
+        # 异步函数（走 aiomysql），阻塞 IO 由驱动自己在事件循环里等。
+        # 包一层 to_thread 反而会把 coroutine 对象丢进线程池，拿不到结果。
+        "mysql": await mysql_status(),
         "checkpointer": {"status": "ok" if checkpointer else "disabled"},
     }
 
     overall = "ok"
     if checks["redis"]["status"] != "ok" or checks["session_dir"]["status"] != "ok":
         overall = "error"
-    elif checks["mcp"]["status"] == "error":
+    elif checks["mcp"]["status"] == "error" or checks["mysql"]["status"] == "error":
         # not_started 不算降级：MCP 是懒加载的，没人传过该领域的 PDF 就还没拉起来，
         # 这是正常初始态；只有明确报 error（上下文在但 session 是空的）才是真降级。
+        # MySQL 同理：连不上只是记忆退化成进程内存，问答本身照跑，不该判死。
         overall = "degraded"
 
     response.status_code = 503 if overall == "error" else 200

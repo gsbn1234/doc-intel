@@ -11,7 +11,8 @@
   · 没配 Key → 放行（本地开发默认）；配了 Key → 不带/带错都是 401
   · Bearer 和 X-API-Key 两种头都认
   · /api/health 不需要鉴权（探针没凭据，要鉴权的话探针永远 401）
-  · Redis / 索引目录挂了 → 503；只有 MCP 出问题 → degraded 但仍是 200
+  · Redis / 索引目录挂了 → 503；MCP 或 MySQL 出问题 → degraded 但仍是 200
+    （软依赖挂了不代表服务不能干活，判 503 反而会让编排系统误摘流量）
   · 关停时真的会去 close_mcp（这类钩子漏挂平时没症状，只有退出时才看得出来）
 
 不碰网络、不碰真 Redis：外部依赖全换成桩。
@@ -105,12 +106,24 @@ def test_upload_route_is_also_protected(monkeypatch):
 
 # ========== 二、健康检查 ==========
 
-def _health(redis=None, mcp=None, sessions_dir=None, api_key="s3cret"):
-    """打一次健康检查，三个依赖各换成指定桩。"""
+def _health(redis=None, mcp=None, mysql=None, sessions_dir=None, api_key="s3cret"):
+    """打一次健康检查，各依赖换成指定桩。
+
+    mysql 默认给"健康"：绝大多数用例关心的是 redis / mcp，不该被 MySQL 带偏。
+    """
+    if mysql is None:
+        mysql = {"status": "ok", "database": "doc_intel"}
+
+    async def _mysql_stub():
+        # 必须是 async：backend 里是 `await mysql_status()`，桩返回裸 dict 的话
+        # 会炸在 "object dict can't be used in 'await' expression"。
+        return mysql
+
     patches = [
         patch.object(backend, "API_KEY", api_key),
         patch.object(backend, "redis_status", lambda: redis),
         patch.object(backend, "mcp_status", lambda: mcp),
+        patch.object(backend, "mysql_status", _mysql_stub),
     ]
     if sessions_dir is not None:
         patches.append(patch.object(backend, "SESSIONS_DIR", sessions_dir))
@@ -143,7 +156,7 @@ def test_health_ok_when_all_dependencies_up(tmp_path):
     body = resp.json()
     assert body["status"] == "ok"
     assert body["active_sessions"] == 3
-    assert set(body["checks"]) == {"redis", "session_dir", "mcp", "checkpointer"}
+    assert set(body["checks"]) == {"redis", "session_dir", "mcp", "mysql", "checkpointer"}
     assert body["checks"]["session_dir"]["path"] == str(tmp_path)
 
 
@@ -194,6 +207,41 @@ def test_health_mcp_not_started_is_not_degraded(tmp_path):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+def test_health_degraded_but_200_when_mysql_broken(tmp_path):
+    """MySQL 是软依赖：连不上只是记忆退回进程内存，问答本身照跑。
+
+    这里特意断言 200 而不是 503 —— 判 503 会让编排系统把一个其实能正常
+    服务的实例摘掉流量，比不判还糟。
+    """
+    resp = _health(
+        redis={"status": "ok", "active_sessions": 1},
+        mcp={"status": "connected"},
+        mysql={"status": "error", "detail": "OperationalError: Can't connect to MySQL server"},
+        sessions_dir=tmp_path,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert "Can't connect" in body["checks"]["mysql"]["detail"]
+    # 软依赖挂了不影响会话数照常上报
+    assert body["active_sessions"] == 1
+
+
+def test_health_hard_dependency_wins_over_soft(tmp_path):
+    """硬依赖（Redis）和软依赖（MySQL）同时挂 → 503 优先。
+
+    保证两档判定不会互相覆盖：先判硬依赖，硬依赖不 ok 就直接 error。
+    """
+    resp = _health(
+        redis={"status": "error", "detail": "ConnectionError: refused"},
+        mcp={"status": "error", "detail": "session 为空"},
+        mysql={"status": "error", "detail": "OperationalError: refused"},
+        sessions_dir=tmp_path,
+    )
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "error"
 
 
 def test_health_redis_probe_failure_is_reported_not_raised():
